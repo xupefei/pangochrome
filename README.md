@@ -88,6 +88,8 @@ packages, and the extension's unit tests.
   proxy, so HTTP/3 sites use TCP instead.
 - A host name that resolves to a resource IP in public DNS goes direct. Use
   the Pangolin alias or the IP address instead.
+- With an exit node on, the helper resolves public names with 1.1.1.1 and
+  8.8.8.8, over TCP through the tunnel. Exit nodes do not always forward UDP.
 - Listing exit nodes needs a role that can list the org's site resources.
   The Pangolin CLI has the same rule.
 - Resources that need an exit-node server connection, such as AI gateway
