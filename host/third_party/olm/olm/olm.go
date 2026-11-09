@@ -28,6 +28,7 @@ import (
 	olmDevice "github.com/fosrl/olm/device"
 	"github.com/fosrl/olm/dns"
 	dnsOverride "github.com/fosrl/olm/dns/override"
+	"github.com/fosrl/olm/hostnet"
 	"github.com/fosrl/olm/peers"
 	"github.com/fosrl/olm/subnetrouter"
 	"github.com/fosrl/olm/websocket"
@@ -147,6 +148,9 @@ type Olm struct {
 	// External DNS watchdog process (spawned after DNS override is installed).
 	// nil when no watchdog is running.
 	dnsWatchdogCmd *exec.Cmd
+
+	// netstack holds the userspace stack in netstack mode - see netstack.go.
+	netstack netstackState
 }
 
 // getPeerManager safely returns the current peerManager under a read-lock.
@@ -268,11 +272,14 @@ func Init(ctx context.Context, config OlmConfig) (*Olm, error) {
 		config.WakeUpDebounce = 3 * time.Second
 	}
 
-	logger.Debug("Checking permissions for native interface")
-	err := permissions.CheckNativeInterfacePermissions()
-	if err != nil {
-		logger.Fatal("Insufficient permissions to create native TUN interface: %v", err)
-		return nil, err
+	if config.Netstack {
+		hostnet.Disable()
+	} else {
+		logger.Debug("Checking permissions for native interface")
+		if err := permissions.CheckNativeInterfacePermissions(); err != nil {
+			logger.Fatal("Insufficient permissions to create native TUN interface: %v", err)
+			return nil, err
+		}
 	}
 
 	var apiServer *api.API
@@ -923,6 +930,8 @@ func (o *Olm) StartTunnel(config TunnelConfig) {
 }
 
 func (o *Olm) Close() {
+	o.clearNetstack()
+
 	// Stop registration first to prevent it from trying to use closed websocket
 	if o.stopRegister != nil {
 		logger.Debug("Stopping registration interval")

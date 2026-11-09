@@ -1,6 +1,7 @@
 package olm
 
 import (
+	"net/netip"
 	"time"
 
 	"github.com/fosrl/olm/peers"
@@ -115,6 +116,16 @@ type OlmConfig struct {
 	WatchdogExecutable string
 	WatchdogSubcommand []string
 	WatchdogLogFile    string
+
+	// Netstack runs the WireGuard device on a userspace TCP/IP stack instead
+	// of an OS TUN interface. olm then needs no privileges and changes no
+	// host interfaces or routes. Reach the tunnel through Olm.Net and
+	// Olm.ResolveAlias. Also set TunnelConfig.NativeDNSManaged so olm
+	// leaves the host DNS alone.
+	Netstack bool
+	// NetstackDNS lists the resolvers that Olm.Net uses for names that are
+	// not Pangolin aliases. Queries go through the tunnel.
+	NetstackDNS []netip.Addr
 }
 
 type TunnelConfig struct {

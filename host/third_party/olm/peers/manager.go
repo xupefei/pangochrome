@@ -18,6 +18,7 @@ import (
 	"github.com/fosrl/olm/api"
 	olmDevice "github.com/fosrl/olm/device"
 	"github.com/fosrl/olm/dns"
+	"github.com/fosrl/olm/hostnet"
 	"github.com/fosrl/olm/peers/monitor"
 	"github.com/fosrl/olm/websocket"
 	"golang.zx2c4.com/wireguard/device"
@@ -331,7 +332,7 @@ func (pm *PeerManager) excludeEndpointLocked(ip string) {
 		return
 	}
 	if pm.gatewayExcludedIPs[ip] == 0 {
-		if err := network.AddBypassRouteForDestination(ip, pm.interfaceName); err != nil {
+		if err := hostnet.AddBypassRouteForDestination(ip, pm.interfaceName); err != nil {
 			logger.Error("Gateway: failed to add bypass route for %s: %v", ip, err)
 		}
 	}
@@ -347,7 +348,7 @@ func (pm *PeerManager) unexcludeEndpointLocked(ip string) {
 	}
 	if pm.gatewayExcludedIPs[ip] <= 1 {
 		delete(pm.gatewayExcludedIPs, ip)
-		if err := network.RemoveBypassRouteForDestination(ip); err != nil {
+		if err := hostnet.RemoveBypassRouteForDestination(ip); err != nil {
 			logger.Error("Gateway: failed to remove bypass route for %s: %v", ip, err)
 		}
 		return
@@ -375,7 +376,7 @@ func (pm *PeerManager) activateGatewayLocked() error {
 		}
 	}
 
-	if err := network.AddGatewayDefaultRoute(pm.interfaceName, pm.localIP); err != nil {
+	if err := hostnet.AddGatewayDefaultRoute(pm.interfaceName, pm.localIP); err != nil {
 		return fmt.Errorf("failed to install gateway route: %v", err)
 	}
 
@@ -394,13 +395,13 @@ func (pm *PeerManager) activateGatewayLocked() error {
 // NetworkSettings (mobile, macOS NetworkExtension), which tracks the physical
 // network itself. Must be called with pm.mu held.
 func (pm *PeerManager) startBypassRouteWatcherLocked() {
-	if !network.ManagesHostRoutes() || pm.gatewayRouteWatchCancel != nil {
+	if !hostnet.ManagesHostRoutes() || pm.gatewayRouteWatchCancel != nil {
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	pm.gatewayRouteWatchCancel = cancel
 
-	if err := network.WatchRouteChanges(ctx, pm.ReconcileGatewayBypassRoutes); err != nil {
+	if err := hostnet.WatchRouteChanges(ctx, pm.ReconcileGatewayBypassRoutes); err != nil {
 		logger.Warn("Gateway: failed to watch for route changes, bypass routes will only be re-checked every %v: %v", bypassRouteReconcileInterval, err)
 	}
 
@@ -443,7 +444,7 @@ func (pm *PeerManager) ReconcileGatewayBypassRoutes() {
 		return
 	}
 	for ip := range pm.gatewayExcludedIPs {
-		changed, err := network.ReconcileBypassRoute(ip, pm.interfaceName)
+		changed, err := hostnet.ReconcileBypassRoute(ip, pm.interfaceName)
 		switch {
 		case errors.Is(err, network.ErrNoPhysicalRoute):
 			logger.Debug("Gateway: no physical route for bypass %s yet: %v", ip, err)
@@ -462,12 +463,12 @@ func (pm *PeerManager) ReconcileGatewayBypassRoutes() {
 func (pm *PeerManager) deactivateGatewayLocked() {
 	pm.stopBypassRouteWatcherLocked()
 
-	if err := network.RemoveGatewayDefaultRoute(pm.interfaceName); err != nil {
+	if err := hostnet.RemoveGatewayDefaultRoute(pm.interfaceName); err != nil {
 		logger.Error("Gateway: failed to remove gateway route: %v", err)
 	}
 
 	for ip := range pm.gatewayExcludedIPs {
-		if err := network.RemoveBypassRouteForDestination(ip); err != nil {
+		if err := hostnet.RemoveBypassRouteForDestination(ip); err != nil {
 			logger.Error("Gateway: failed to remove bypass route for %s: %v", ip, err)
 		}
 	}
@@ -782,28 +783,28 @@ func (pm *PeerManager) addRoutes(subnets []string) error {
 	if pm.resourceRoutesSuppressed {
 		return nil
 	}
-	return network.AddRoutesWithSource(subnets, pm.interfaceName, pm.localIP)
+	return hostnet.AddRoutesWithSource(subnets, pm.interfaceName, pm.localIP)
 }
 
 func (pm *PeerManager) removeRoutes(subnets []string) error {
 	if pm.resourceRoutesSuppressed {
 		return nil
 	}
-	return network.RemoveRoutes(subnets, pm.interfaceName)
+	return hostnet.RemoveRoutes(subnets, pm.interfaceName)
 }
 
 func (pm *PeerManager) addServerRoute(serverIP string) error {
 	if pm.resourceRoutesSuppressed {
 		return nil
 	}
-	return network.AddRouteForServerIPWithSource(normalizeServerRouteDestination(serverIP), pm.interfaceName, pm.localIP)
+	return hostnet.AddRouteForServerIPWithSource(normalizeServerRouteDestination(serverIP), pm.interfaceName, pm.localIP)
 }
 
 func (pm *PeerManager) removeServerRoute(serverIP string) error {
 	if pm.resourceRoutesSuppressed {
 		return nil
 	}
-	return network.RemoveRouteForServerIPWithSource(normalizeServerRouteDestination(serverIP), pm.interfaceName, pm.localIP)
+	return hostnet.RemoveRouteForServerIPWithSource(normalizeServerRouteDestination(serverIP), pm.interfaceName, pm.localIP)
 }
 
 // addDNSRecord/removeDNSRecord/removeDNSRecordForSite tolerate a nil proxy
@@ -888,7 +889,7 @@ func (pm *PeerManager) suppressResourceRoutesLocked() {
 
 	removedSubnets := make(map[string]bool, len(pm.peers))
 	for siteId, peer := range pm.peers {
-		if err := network.RemoveRouteForServerIPWithSource(normalizeServerRouteDestination(peer.ServerIP), pm.interfaceName, pm.localIP); err != nil {
+		if err := hostnet.RemoveRouteForServerIPWithSource(normalizeServerRouteDestination(peer.ServerIP), pm.interfaceName, pm.localIP); err != nil {
 			logger.Warn("Exit node active: failed to remove route for server IP %s: %v", peer.ServerIP, err)
 		}
 		for _, subnet := range peer.RemoteSubnets {
@@ -896,7 +897,7 @@ func (pm *PeerManager) suppressResourceRoutesLocked() {
 				continue
 			}
 			removedSubnets[subnet] = true
-			if err := network.RemoveRoutes([]string{subnet}, pm.interfaceName); err != nil {
+			if err := hostnet.RemoveRoutes([]string{subnet}, pm.interfaceName); err != nil {
 				logger.Warn("Exit node active: failed to remove route for remote subnet %s: %v", subnet, err)
 			}
 		}
@@ -937,7 +938,7 @@ func (pm *PeerManager) restoreResourceRoutesLocked() {
 
 	addedSubnets := make(map[string]bool, len(pm.peers))
 	for siteId, peer := range pm.peers {
-		if err := network.AddRouteForServerIPWithSource(normalizeServerRouteDestination(peer.ServerIP), pm.interfaceName, pm.localIP); err != nil {
+		if err := hostnet.AddRouteForServerIPWithSource(normalizeServerRouteDestination(peer.ServerIP), pm.interfaceName, pm.localIP); err != nil {
 			logger.Warn("Exit node inactive: failed to add route for server IP %s: %v", peer.ServerIP, err)
 		}
 		for _, subnet := range peer.RemoteSubnets {
@@ -945,7 +946,7 @@ func (pm *PeerManager) restoreResourceRoutesLocked() {
 				continue
 			}
 			addedSubnets[subnet] = true
-			if err := network.AddRoutesWithSource([]string{subnet}, pm.interfaceName, pm.localIP); err != nil {
+			if err := hostnet.AddRoutesWithSource([]string{subnet}, pm.interfaceName, pm.localIP); err != nil {
 				logger.Warn("Exit node inactive: failed to add route for remote subnet %s: %v", subnet, err)
 			}
 		}
