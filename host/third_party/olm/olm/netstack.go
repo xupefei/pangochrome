@@ -85,8 +85,21 @@ func (o *Olm) ResolveAlias(name string) ([]netip.Addr, bool) {
 	return addrs, len(addrs) > 0
 }
 
-// Sites returns a copy of the site peers of the current connection, with
-// their remote subnets and aliases.
+// AliasNames returns every Pangolin alias name and wildcard pattern of the
+// current connection, including aliases of sites that connect just in time.
+func (o *Olm) AliasNames() []string {
+	o.netstack.mu.RLock()
+	proxy := o.netstack.dnsProxy
+	o.netstack.mu.RUnlock()
+	if proxy == nil {
+		return nil
+	}
+	return proxy.LocalNames()
+}
+
+// Sites returns a copy of the connected site peers, with their remote
+// subnets and aliases. Sites that connect just in time appear only after
+// they connect.
 func (o *Olm) Sites() []peers.SiteConfig {
 	pm := o.getPeerManager()
 	if pm == nil {

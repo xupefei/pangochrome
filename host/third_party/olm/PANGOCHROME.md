@@ -24,11 +24,12 @@ and `SubnetRouter` false.
   first.
 - `olm/connect.go`: `handleConnect` creates the netstack device in netstack
   mode and publishes the stack when the connection is ready.
-- `olm/netstack.go` (new): device creation and the `Net`, `ResolveAlias` and
-  `Sites` accessors.
+- `olm/netstack.go` (new): device creation and the `Net`, `ResolveAlias`,
+  `AliasNames` and `Sites` accessors.
 - `olm/types.go`: `OlmConfig.Netstack` and `OlmConfig.NetstackDNS`.
 - `dns/resolve_local.go` (new): `DNSProxy.ResolveLocal`, an in-process alias
-  lookup that also starts a just-in-time site connection.
+  lookup that also starts a just-in-time site connection, and
+  `DNSProxy.LocalNames`, the list of alias names.
 - `peers/snapshot.go` (new): `PeerManager.SnapshotPeers`, a deep copy of the
   site peers.
 
