@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { classifyDisconnect, NativeClient, type NativeEvent, type NativePort } from "./native";
 
+function validState(phase: string): Record<string, unknown> {
+  return { phase, orgs: [], sites: [], routes: { hosts: [], cidrs: [] } };
+}
+
 class FakePort implements NativePort {
   readonly posted: unknown[] = [];
   disconnected = false;
@@ -166,12 +170,12 @@ describe("NativeClient", () => {
     const { client, ports, events } = setup();
     client.start();
     const port = lastPort(ports);
-    port.receive({ event: "state", state: { phase: "connected" } });
+    port.receive({ event: "state", state: validState("connected") });
     port.receive({ unrelated: true });
     port.receive("text");
     expect(events).toEqual([
       { type: "open" },
-      { type: "state", state: { phase: "connected" } },
+      { type: "state", state: validState("connected") },
     ]);
   });
 
@@ -234,7 +238,7 @@ describe("NativeClient", () => {
     expect(ports).toHaveLength(6);
   });
 
-  it("resets the backoff after a valid message", () => {
+  it("keeps the grown backoff when a port closes after a message, before it stays open for 30 s", () => {
     const { client, ports } = setup();
     client.start();
 
@@ -242,12 +246,44 @@ describe("NativeClient", () => {
     vi.advanceTimersByTime(100);
     expect(ports).toHaveLength(2);
 
-    lastPort(ports).receive({ event: "state", state: { phase: "disconnected" } });
+    // A helper that answers once and then crashes must not be retried every second.
+    lastPort(ports).receive({ event: "state", state: validState("disconnected") });
+    lastPort(ports).close();
+    vi.advanceTimersByTime(199);
+    expect(ports).toHaveLength(2);
+    vi.advanceTimersByTime(1);
+    expect(ports).toHaveLength(3);
+  });
+
+  it("resets the backoff once a port has stayed open for 30 s", () => {
+    const { client, ports } = setup();
+    client.start();
+
+    lastPort(ports).close();
+    vi.advanceTimersByTime(100);
+    expect(ports).toHaveLength(2);
+
+    vi.advanceTimersByTime(30_000);
     lastPort(ports).close();
     vi.advanceTimersByTime(99);
     expect(ports).toHaveLength(2);
     vi.advanceTimersByTime(1);
     expect(ports).toHaveLength(3);
+  });
+
+  it("drops a state event that fails validation and keeps the others", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { client, ports, events } = setup();
+    client.start();
+    const port = lastPort(ports);
+    port.receive({ event: "state", state: { phase: "bogus", orgs: [], sites: [], routes: {} } });
+    port.receive({ event: "state", state: validState("disconnected") });
+    expect(events).toEqual([
+      { type: "open" },
+      { type: "state", state: validState("disconnected") },
+    ]);
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
   });
 
   it("restart drops the current port and opens a new one now", async () => {

@@ -1,5 +1,6 @@
 import type { HelperStatus } from "./messages";
 import type { State } from "./protocol";
+import type { ProxyMode } from "./routing";
 
 export interface BadgeView {
   text: string;
@@ -7,26 +8,32 @@ export interface BadgeView {
 }
 
 const EMPTY: BadgeView = { text: "", color: "#6B6B6B" };
-const CONNECTED: BadgeView = { text: "ON", color: "#1E8E3E" };
-const EXIT_NODE: BadgeView = { text: "EXIT", color: "#4C78C6" };
-const CONNECTING: BadgeView = { text: "...", color: "#6B6B6B" };
-const ERROR: BadgeView = { text: "!", color: "#D93025" };
+const ON: BadgeView = { text: "ON", color: "#1E8E3E" };
+const EXIT: BadgeView = { text: "EXIT", color: "#4C78C6" };
+const STOP: BadgeView = { text: "STOP", color: "#D93025" };
+const ERROR: BadgeView = { text: "!", color: "#E5832A" };
 
-export function badgeFor(input: {
+export interface BadgeInput {
   helper: HelperStatus;
   state: State | null;
   error: string | null;
-}): BadgeView {
-  const { helper, state } = input;
+  /** The routing mode in effect. Null when the last proxy write failed or none was made. */
+  mode: ProxyMode | null;
+}
+
+/**
+ * Shows what the browser routes, not what the helper reports. ON and EXIT appear
+ * only while the connected PAC is in effect. STOP shows when traffic is blocked,
+ * including an exit node that is chosen but not yet active.
+ */
+export function badgeFor(input: BadgeInput): BadgeView {
+  const { helper, state, mode } = input;
   if (helper.kind === "notInstalled" || helper.kind === "failed") return ERROR;
   if (input.error !== null || state?.error) return ERROR;
-  if (helper.kind !== "ready" || state === null) return EMPTY;
-  switch (state.phase) {
-    case "connected":
-      return state.exitNode?.active === true ? EXIT_NODE : CONNECTED;
-    case "connecting":
-      return CONNECTING;
-    default:
-      return EMPTY;
+  if (mode === "failClosed") return STOP;
+  if (mode === "connected" && state !== null) {
+    if (!state.exitNode) return ON;
+    return state.exitNode.active ? EXIT : STOP;
   }
+  return EMPTY;
 }

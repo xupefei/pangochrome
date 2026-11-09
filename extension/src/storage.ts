@@ -55,8 +55,8 @@ function parseLastConnected(value: unknown): LastConnected | null {
   if (typeof routes !== "object" || routes === null) return null;
   const { hosts, cidrs } = routes as Record<string, unknown>;
   if (!isStringArray(hosts) || !isStringArray(cidrs)) return null;
-  if (typeof record["exitNodeActive"] !== "boolean") return null;
-  return { routes: { hosts, cidrs }, exitNodeActive: record["exitNodeActive"] };
+  if (typeof record["exitNodeChosen"] !== "boolean") return null;
+  return { routes: { hosts, cidrs }, exitNodeChosen: record["exitNodeChosen"] };
 }
 
 function isStringArray(value: unknown): value is string[] {

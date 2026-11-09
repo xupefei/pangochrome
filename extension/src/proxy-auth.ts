@@ -1,4 +1,4 @@
-// Portions adapted from tailchrome (https://github.com/dantraynor/tailchrome), MIT licence, Copyright (c) 2026 Tesseras.
+// Portions adapted from tailchrome (https://github.com/dantraynor/tailchrome), MIT licence, Copyright (c) 2026 Tesseras. See static/THIRD_PARTY_NOTICES.txt.
 
 export interface ProxyCredentials {
   port: number;
@@ -31,13 +31,13 @@ export class ProxyAuth {
   /** Register with chrome.webRequest.onAuthRequired using the "asyncBlocking" option. */
   readonly listener = (details: ChallengeDetails, callback?: ChallengeCallback): undefined => {
     const credentials = this.credentials;
-    if (
-      !details.isProxy ||
-      details.challenger.host !== "127.0.0.1" ||
-      credentials === null ||
-      details.challenger.port !== credentials.port
-    ) {
+    if (!details.isProxy || details.challenger.host !== "127.0.0.1") {
       callback?.({});
+      return;
+    }
+    // A loopback challenge that we cannot answer would show Chrome's login dialog.
+    if (credentials === null || details.challenger.port !== credentials.port) {
+      callback?.({ cancel: true });
       return;
     }
     // A second challenge for the same request means the helper rejected the credentials.

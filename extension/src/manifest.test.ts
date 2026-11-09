@@ -19,11 +19,16 @@ describe("static/manifest.json", () => {
     expect(manifest["action"]).toMatchObject({ default_popup: "popup.html" });
     expect(manifest["permissions"]).toEqual([
       "nativeMessaging",
+      "privacy",
       "proxy",
       "storage",
       "webRequest",
       "webRequestAuthProvider",
     ]);
     expect(manifest["host_permissions"]).toEqual(["<all_urls>"]);
+  });
+
+  it("requires Chrome 120, which the extension's APIs need", () => {
+    expect(manifest["minimum_chrome_version"]).toBe("120");
   });
 });

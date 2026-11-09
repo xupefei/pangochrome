@@ -6,7 +6,7 @@
   "scripts": {
     "build": "node build.mjs",
     "icons": "node scripts/make-icons.mjs",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
     "test": "vitest run"
   },
   "devDependencies": {

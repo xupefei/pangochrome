@@ -11,37 +11,60 @@ function stateIn(phase: Phase, extra: Partial<State> = {}): State {
 
 describe("badgeFor", () => {
   it("shows an error when the helper is missing or failed", () => {
-    expect(badgeFor({ helper: { kind: "notInstalled" }, state: null, error: null }).text).toBe("!");
+    expect(badgeFor({ helper: { kind: "notInstalled" }, state: null, error: null, mode: null }).text).toBe("!");
     expect(
-      badgeFor({ helper: { kind: "failed", message: "x" }, state: null, error: null }).text,
+      badgeFor({ helper: { kind: "failed", message: "x" }, state: null, error: null, mode: "failClosed" }).text,
     ).toBe("!");
   });
 
-  it("shows an error for a routing failure or a state error", () => {
-    expect(badgeFor({ helper: READY, state: stateIn("disconnected"), error: "x" }).text).toBe("!");
+  it("shows an error for a routing or connect failure, or a state error", () => {
     expect(
-      badgeFor({ helper: READY, state: stateIn("disconnected", { error: "x" }), error: null }).text,
+      badgeFor({ helper: READY, state: stateIn("disconnected"), error: "x", mode: null }).text,
+    ).toBe("!");
+    expect(
+      badgeFor({
+        helper: READY,
+        state: stateIn("disconnected", { error: "x" }),
+        error: null,
+        mode: "failClosed",
+      }).text,
     ).toBe("!");
   });
 
-  it("is empty while the helper starts", () => {
-    expect(badgeFor({ helper: { kind: "starting" }, state: null, error: null }).text).toBe("");
+  it("shows STOP while the fail-closed PAC is in effect, even before the helper is ready", () => {
+    expect(badgeFor({ helper: { kind: "starting" }, state: null, error: null, mode: "failClosed" }).text).toBe(
+      "STOP",
+    );
+    expect(badgeFor({ helper: READY, state: stateIn("connecting"), error: null, mode: "failClosed" }).text).toBe(
+      "STOP",
+    );
   });
 
-  it("shows ON when connected and EXIT when the exit node is active", () => {
-    expect(badgeFor({ helper: READY, state: stateIn("connected"), error: null }).text).toBe("ON");
-    const exit = stateIn("connected", {
+  it("shows ON when the connected PAC is in effect and no exit node is chosen", () => {
+    expect(badgeFor({ helper: READY, state: stateIn("connected"), error: null, mode: "connected" }).text).toBe(
+      "ON",
+    );
+  });
+
+  it("shows EXIT when the exit node is active and STOP while it is chosen but not active", () => {
+    const active = stateIn("connected", {
       exitNode: { siteResourceId: 1, name: "Gateway", active: true },
     });
-    expect(badgeFor({ helper: READY, state: exit, error: null }).text).toBe("EXIT");
+    expect(badgeFor({ helper: READY, state: active, error: null, mode: "connected" }).text).toBe("EXIT");
+    const pending = stateIn("connected", {
+      exitNode: { siteResourceId: 1, name: "Gateway", active: false },
+    });
+    expect(badgeFor({ helper: READY, state: pending, error: null, mode: "connected" }).text).toBe("STOP");
   });
 
-  it("shows a pending marker while connecting", () => {
-    expect(badgeFor({ helper: READY, state: stateIn("connecting"), error: null }).text).toBe("...");
+  it("never shows ON or EXIT while the proxy is clear or was not written", () => {
+    const connected = stateIn("connected");
+    expect(badgeFor({ helper: READY, state: connected, error: null, mode: "clear" }).text).toBe("");
+    expect(badgeFor({ helper: READY, state: connected, error: null, mode: null }).text).toBe("");
   });
 
-  it("is empty when disconnected or logged out", () => {
-    expect(badgeFor({ helper: READY, state: stateIn("disconnected"), error: null }).text).toBe("");
-    expect(badgeFor({ helper: READY, state: stateIn("loggedOut"), error: null }).text).toBe("");
+  it("is empty when the user has turned the connection off", () => {
+    expect(badgeFor({ helper: READY, state: stateIn("disconnected"), error: null, mode: "clear" }).text).toBe("");
+    expect(badgeFor({ helper: READY, state: stateIn("loggedOut"), error: null, mode: "clear" }).text).toBe("");
   });
 });

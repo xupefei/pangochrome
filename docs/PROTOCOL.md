@@ -98,7 +98,7 @@ interface State {
   error?: string;           // last error, cleared by the next successful action
   sites: Site[];            // empty unless connecting or connected
   routes: Routes;           // empty unless connected
-  exitNode?: {               // the chosen exit node of the org, if any
+  exitNode?: {               // the chosen exit node of the org, in every phase
     siteResourceId: number;
     name: string;
     active: boolean;        // true when the tunnel routes all traffic through it

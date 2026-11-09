@@ -62,9 +62,11 @@ func TestStatePhases(t *testing.T) {
 		t.Fatalf("exit node while disconnected: %+v", got.ExitNode)
 	}
 
-	// A session that ended keeps the user for the next login but hides orgs.
+	// A session that ended keeps the user and the exit-node choice, so the
+	// extension keeps failing closed, but hides the orgs.
 	s.acct.SessionToken = ""
-	if got := s.state(); got.Phase != "loggedOut" || got.User == nil || len(got.Orgs) != 0 || got.ExitNode != nil {
+	got = s.state()
+	if got.Phase != "loggedOut" || got.User == nil || len(got.Orgs) != 0 || got.ExitNode == nil || got.ExitNode.Active {
 		t.Fatalf("session ended: %+v", got)
 	}
 }

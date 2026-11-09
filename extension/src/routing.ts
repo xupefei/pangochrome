@@ -10,9 +10,12 @@ export const FAIL_CLOSED_PROXY = "PROXY 127.0.0.1:1";
  */
 export type ProxyMode = "clear" | "connected" | "failClosed";
 
+export type WebRtcPolicy = "disable_non_proxied_udp" | "default";
+
 export interface LastConnected {
   routes: Routes;
-  exitNodeActive: boolean;
+  /** True when the connected state had an exit node chosen, whether or not it was active. */
+  exitNodeChosen: boolean;
 }
 
 export interface RoutingInput {
@@ -27,20 +30,38 @@ export interface RoutingPlan {
   mode: ProxyMode;
   /** The PAC script to apply, or null to clear the proxy settings. */
   pac: string | null;
+  /** True when every host except the local exceptions goes to the helper. */
+  catchAll: boolean;
+  webRtc: WebRtcPolicy;
+}
+
+/**
+ * Whether an exit node is chosen. The current state decides when there is one,
+ * so choosing None while disconnected lifts the catch-all. Otherwise the last connected state decides.
+ */
+export function exitNodeChosen(state: State | null, last: LastConnected | null): boolean {
+  if (state !== null) return Boolean(state.exitNode);
+  return last?.exitNodeChosen === true;
 }
 
 export function planRouting(input: RoutingInput): RoutingPlan {
-  if (!input.wantConnected) return { mode: "clear", pac: null };
+  if (!input.wantConnected) {
+    return { mode: "clear", pac: null, catchAll: false, webRtc: "default" };
+  }
 
   const { state, proxyPort } = input;
+  const catchAll = exitNodeChosen(state, input.lastConnected);
+  const webRtc: WebRtcPolicy = catchAll ? "disable_non_proxied_udp" : "default";
   if (input.helperReady && proxyPort !== null && state?.phase === "connected") {
     return {
       mode: "connected",
       pac: buildPac({
         proxy: `PROXY 127.0.0.1:${proxyPort}`,
         routes: state.routes,
-        exitNodeActive: state.exitNode?.active === true,
+        catchAll,
       }),
+      catchAll,
+      webRtc,
     };
   }
 
@@ -50,16 +71,22 @@ export function planRouting(input: RoutingInput): RoutingPlan {
     pac: buildPac({
       proxy: FAIL_CLOSED_PROXY,
       routes: last?.routes ?? { hosts: [], cidrs: [] },
-      exitNodeActive: last?.exitNodeActive ?? false,
+      catchAll,
     }),
+    catchAll,
+    webRtc,
   };
 }
 
-/** The routing facts to keep for fail-closed use, or null when the state is not connected. */
-export function lastConnectedFrom(state: State | null): LastConnected | null {
-  if (state?.phase !== "connected") return null;
-  return {
-    routes: { hosts: [...state.routes.hosts], cidrs: [...state.routes.cidrs] },
-    exitNodeActive: state.exitNode?.active === true,
-  };
+/**
+ * The routing facts to keep for fail-closed use. Routes come from the last
+ * connected state. The exit-node choice comes from the latest state in any
+ * phase, so it is still known if the helper stops before it connects.
+ */
+export function lastConnectedFrom(state: State, previous: LastConnected | null): LastConnected {
+  const routes =
+    state.phase === "connected"
+      ? { hosts: [...state.routes.hosts], cidrs: [...state.routes.cidrs] }
+      : previous?.routes ?? { hosts: [], cidrs: [] };
+  return { routes, exitNodeChosen: Boolean(state.exitNode) };
 }

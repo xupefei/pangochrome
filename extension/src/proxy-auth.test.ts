@@ -18,16 +18,27 @@ describe("ProxyAuth listener", () => {
     });
   });
 
-  it("does not answer challenges from another host or port", () => {
+  it("passes challenges from other hosts to Chrome without answering them", () => {
     const auth = new ProxyAuth();
     auth.set(CREDENTIALS);
     const otherHost = vi.fn();
     auth.listener(challenge("example.com", 8123, "1"), otherHost);
     expect(otherHost).toHaveBeenCalledWith({});
+  });
 
+  it("cancels a loopback challenge from another port, so no login dialog appears", () => {
+    const auth = new ProxyAuth();
+    auth.set(CREDENTIALS);
     const otherPort = vi.fn();
     auth.listener(challenge("127.0.0.1", 9999, "2"), otherPort);
-    expect(otherPort).toHaveBeenCalledWith({});
+    expect(otherPort).toHaveBeenCalledWith({ cancel: true });
+  });
+
+  it("cancels a loopback challenge when no credentials are set", () => {
+    const auth = new ProxyAuth();
+    const callback = vi.fn();
+    auth.listener(challenge("127.0.0.1", 8123, "3"), callback);
+    expect(callback).toHaveBeenCalledWith({ cancel: true });
   });
 
   it("does not answer server challenges", () => {
@@ -53,7 +64,7 @@ describe("ProxyAuth listener", () => {
     auth.set(null);
     const callback = vi.fn();
     auth.listener(challenge("127.0.0.1", 8123, "1"), callback);
-    expect(callback).toHaveBeenCalledWith({});
+    expect(callback).toHaveBeenCalledWith({ cancel: true });
   });
 
   it("accepts a call without a callback", () => {

@@ -5,7 +5,8 @@ import type {
   PopupToBackground,
   Snapshot,
 } from "./messages";
-import type { ExitNode, Site, State } from "./protocol";
+import type { ExitNode, LoginInfo, Site, State } from "./protocol";
+import { isHttpUrl, isPlainHostname } from "./url";
 
 const INSTALL_COMMAND = "pangochrome-helper install";
 const CLOUD_SERVER = "https://app.pangolin.net";
@@ -39,6 +40,10 @@ let selfHostedUrl = "";
 let siteQuery = "";
 let siteListEl: HTMLElement | null = null;
 let lastRenderKey = "";
+/** Keys of the actions in flight. Kept here so a re-render does not re-enable a control. */
+const busy = new Set<string>();
+/** The value that the connect toggle shows while its request is in flight. */
+let pendingToggle: boolean | null = null;
 
 connect();
 render(true);
@@ -95,15 +100,27 @@ function call<T>(action: PopupAction): Promise<T> {
   });
 }
 
-/** Sends an action and shows its error, if any. Always re-renders, so disabled controls recover. */
-async function act(action: PopupAction): Promise<void> {
+/**
+ * Sends an action and disables its control until the reply arrives. A second
+ * action with the same key is ignored while the first is in flight.
+ */
+async function act(busyKey: string, action: PopupAction): Promise<void> {
+  if (busy.has(busyKey)) return;
+  busy.add(busyKey);
   localError = null;
+  render(true);
   try {
     await call<unknown>(action);
   } catch (err) {
     localError = describeError(err);
+  } finally {
+    busy.delete(busyKey);
   }
   render(true);
+}
+
+function isBusy(...keys: string[]): boolean {
+  return keys.some((key) => busy.has(key));
 }
 
 function loadExitNodesIfNeeded(): void {
@@ -129,7 +146,7 @@ async function loadExitNodes(orgKey: string): Promise<void> {
 }
 
 function render(force = false): void {
-  const key = JSON.stringify([snapshot, exitNodes, localError, loginChoice]);
+  const key = JSON.stringify([snapshot, exitNodes, localError, loginChoice, pendingToggle, [...busy]]);
   if (!force && key === lastRenderKey) return;
   lastRenderKey = key;
   const focused = document.activeElement;
@@ -144,20 +161,22 @@ function buildView(): HTMLElement {
   if (!snapshot) return statusView("Loading...");
   const { helper, state } = snapshot;
   if (helper.kind === "notInstalled" || helper.kind === "failed") return helperView(helper);
-  if (helper.kind !== "ready" || state === null) return statusView("Starting the helper...");
+  if (helper.kind !== "ready" || state === null) {
+    return statusView("Starting the helper...");
+  }
   switch (state.phase) {
     case "loggedOut":
-      return loginView(snapshot.error);
+      return loginView(state);
     case "loggingIn":
-      return loggingInView(state, snapshot.error);
+      return loggingInView(state);
     default:
-      return mainView(state, snapshot.wantConnected, snapshot.error);
+      return mainView(state, snapshot);
   }
 }
 
 function statusView(text: string): HTMLElement {
   const view = section();
-  view.append(el("p", "muted", text));
+  view.append(el("p", "muted", text), ...blockedParts("helper"), ...banners(localError));
   return view;
 }
 
@@ -176,17 +195,16 @@ function helperView(helper: HelperStatus): HTMLElement {
       ...banners(helper.message),
     );
   }
-  view.append(
-    actionRow([
-      button("Retry", "btn btn-primary", () => act({ action: "retryHelper" }), {
-        "data-focus": "retry",
-      }),
-    ]),
-  );
+  view.append(...blockedParts("helper"), ...banners(localError));
+  const retry = button("Retry", "btn btn-primary", () => act("retry", { action: "retryHelper" }), {
+    "data-focus": "retry",
+  });
+  retry.disabled = isBusy("retry");
+  view.append(actionRow([retry]));
   return view;
 }
 
-function loginView(error: string | null): HTMLElement {
+function loginView(state: State): HTMLElement {
   const view = section();
   view.append(heading("Log in"), el("p", "muted", "Choose the Pangolin server for this browser."));
 
@@ -198,12 +216,11 @@ function loginView(error: string | null): HTMLElement {
   );
   view.append(choices);
 
-  const submit = button("Log in", "btn btn-primary", async () => {
+  const submit = button("Log in", "btn btn-primary", () => {
     const server = loginChoice === "cloud" ? CLOUD_SERVER : selfHostedUrl.trim();
-    submit.disabled = true;
-    await act({ action: "login", server });
+    void act("login", { action: "login", server });
   }, { "data-focus": "login" });
-  submit.disabled = loginChoice === "self" && selfHostedUrl.trim() === "";
+  submit.disabled = isBusy("login") || (loginChoice === "self" && selfHostedUrl.trim() === "");
 
   if (loginChoice === "self") {
     const input = el("input", "", undefined, {
@@ -218,12 +235,16 @@ function loginView(error: string | null): HTMLElement {
     input.value = selfHostedUrl;
     input.addEventListener("input", () => {
       selfHostedUrl = input.value;
-      submit.disabled = selfHostedUrl.trim() === "";
+      submit.disabled = isBusy("login") || selfHostedUrl.trim() === "";
     });
     view.append(labelled("Server URL", input));
   }
 
-  view.append(...banners(error, localError), actionRow([submit]));
+  view.append(
+    ...banners(state.error, snapshot?.error, localError),
+    ...blockedParts("login"),
+    actionRow([submit]),
+  );
   return view;
 }
 
@@ -245,47 +266,77 @@ function radioChoice(value: "cloud" | "self", label: string): HTMLElement {
   return row;
 }
 
-function loggingInView(state: State, error: string | null): HTMLElement {
+function loggingInView(state: State): HTMLElement {
   const view = section();
   const login = state.login;
   view.append(
     heading("Approve this login"),
     el("p", "muted", "Open the approval page and check that it shows this code."),
-    el("div", "code-large", login?.code ?? "...", {
-      "aria-label": login ? `Approval code ${login.code}` : "Waiting for the approval code",
-    }),
-    ...banners(error, localError),
+    el("div", "code-large", login?.code ?? "..."),
+    ...banners(state.error, snapshot?.error, localError),
+    ...blockedParts("login"),
   );
   const open = button("Open approval page", "btn btn-primary", () => {
-    if (login) void chrome.tabs.create({ url: login.url });
+    if (login) openApprovalPage(login);
   }, { "data-focus": "approval" });
   open.disabled = login === undefined;
-  view.append(
-    actionRow([
-      open,
-      button("Cancel", "btn", () => act({ action: "cancelLogin" }), { "data-focus": "cancel" }),
-    ]),
-  );
+  const cancel = button("Cancel", "btn", () => act("cancel", { action: "cancelLogin" }), {
+    "data-focus": "cancel",
+  });
+  cancel.disabled = isBusy("cancel");
+  view.append(actionRow([open, cancel]));
   return view;
 }
 
-function mainView(state: State, wantConnected: boolean, error: string | null): HTMLElement {
+function openApprovalPage(login: LoginInfo): void {
+  openUrl(login.url);
+}
+
+function mainView(state: State, snap: Snapshot): HTMLElement {
   const view = section();
-  view.append(header(state, wantConnected));
-  if (state.orgs.length > 1) view.append(orgField(state));
+  view.append(header(state, snap));
+  view.append(...blockedParts("helper"));
+  if (snap.wantConnected && state.phase === "disconnected") {
+    const reconnect = button("Reconnect", "btn btn-primary", () => act("reconnect", { action: "reconnect" }), {
+      "data-focus": "reconnect",
+    });
+    reconnect.disabled = isBusy("reconnect");
+    view.append(actionRow([reconnect]));
+  }
+  view.append(...orgSection(state));
   view.append(exitNodeField(state));
-  view.append(...banners(state.error, error, localError));
+  view.append(...banners(state.error, snap.error, localError));
   view.append(sitesCard(state));
   view.append(footer(state));
   return view;
 }
 
-function header(state: State, wantConnected: boolean): HTMLElement {
+/**
+ * The text and the turn-off control shown while the user wants the connection
+ * but traffic is not routed through it. Empty when the connected routing is in effect.
+ */
+function blockedParts(reason: "login" | "helper"): HTMLElement[] {
+  const snap = snapshot;
+  if (!snap || !snap.wantConnected || snap.mode === "connected") return [];
+  const scope = snap.exitChosen ? "All traffic stays" : "Private sites stay";
+  const text =
+    reason === "login"
+      ? `${scope} blocked until you log in.`
+      : `${scope} blocked until Pangochrome connects.`;
+  const turnOff = button("Turn off and browse normally", "btn", () => act("turnOff", {
+    action: "setConnected",
+    connected: false,
+  }), { "data-focus": "turn-off" });
+  turnOff.disabled = isBusy("turnOff", "toggle");
+  return [el("p", "notice", text), actionRow([turnOff])];
+}
+
+function header(state: State, snap: Snapshot): HTMLElement {
   const row = el("div", "header");
   const titles = el("div", "title-block");
   titles.append(
     el("div", "brand", "Pangochrome"),
-    el("div", "status", statusText(state), { "aria-live": "polite" }),
+    el("div", "status", statusText(state, snap), { "aria-live": "polite" }),
   );
   const toggle = el("input", "switch", undefined, {
     type: "checkbox",
@@ -293,35 +344,49 @@ function header(state: State, wantConnected: boolean): HTMLElement {
     "aria-label": "Connect",
     "data-focus": "toggle",
   });
-  toggle.checked = wantConnected;
+  toggle.checked = pendingToggle ?? snap.wantConnected;
+  toggle.disabled = isBusy("toggle");
   toggle.addEventListener("change", () => {
-    void act({ action: "setConnected", connected: toggle.checked });
+    const next = toggle.checked;
+    pendingToggle = next;
+    void act("toggle", { action: "setConnected", connected: next }).then(() => {
+      pendingToggle = null;
+      render(true);
+    });
   });
   row.append(titles, toggle);
   return row;
 }
 
-function statusText(state: State): string {
-  switch (state.phase) {
-    case "connected":
-      return state.exitNode?.active === true
-        ? `Connected via exit node ${state.exitNode.name}`
-        : "Connected";
-    case "connecting":
-      return "Connecting...";
-    default:
-      return "Disconnected";
+/** The status line follows the routing that is in effect, not only the helper's phase. */
+function statusText(state: State, snap: Snapshot): string {
+  if (state.phase === "connecting") return "Connecting...";
+  if (state.phase === "connected" && snap.mode === "connected") {
+    return state.exitNode?.active === true
+      ? `Connected via exit node ${state.exitNode.name}`
+      : "Connected";
   }
+  return "Disconnected";
 }
 
-function orgField(state: State): HTMLElement {
+/** The organisation selector. It appears for several organisations, or when the current one is missing from the list. */
+function orgSection(state: State): HTMLElement[] {
+  if (state.orgs.length === 0) {
+    return [el("p", "muted", "You are not in any organisation.")];
+  }
+  const current = state.orgId ?? "";
+  const missing = current !== "" && !state.orgs.some((org) => org.orgId === current);
+  if (state.orgs.length < 2 && !missing) return [];
+
   const select = el("select", "", undefined, { "data-focus": "org" });
   for (const org of state.orgs) select.append(new Option(org.name, org.orgId));
-  select.value = state.orgId ?? "";
+  if (missing) select.append(new Option(current, current));
+  select.value = current;
+  select.disabled = isBusy("org");
   select.addEventListener("change", () => {
-    void act({ action: "selectOrg", orgId: select.value });
+    void act("org", { action: "selectOrg", orgId: select.value });
   });
-  return labelled("Organisation", select);
+  return [labelled("Organisation", select)];
 }
 
 function exitNodeField(state: State): HTMLElement {
@@ -342,14 +407,14 @@ function exitNodeField(state: State): HTMLElement {
   const select = el("select", "", undefined, { "data-focus": "exit-node" });
   for (const [id, label] of options) select.append(new Option(label, String(id)));
   select.value = String(current);
-  select.disabled = !loaded;
+  select.disabled = !loaded || isBusy("exit");
   select.addEventListener("change", () => {
-    void act({ action: "setExitNode", siteResourceId: Number(select.value) });
+    void act("exit", { action: "setExitNode", siteResourceId: Number(select.value) });
   });
 
   const wrapper = el("div", "stack");
   wrapper.append(labelled("Exit node", select));
-  if (!loaded && !exitNodes.loading && exitNodes.error === null) {
+  if (exitNodes.loading) {
     wrapper.append(el("p", "muted", "Loading exit nodes..."));
   }
   if (loaded && exitNodes.error) {
@@ -433,22 +498,32 @@ function aliasRow(alias: string): HTMLElement {
     "data-focus": `copy:${alias}`,
   });
 
-  // Wildcard patterns are not host names, so they cannot be opened.
-  const wildcard = /[*?]/.test(alias);
-  const open = button("Open", "btn btn-small", () => {
-    void chrome.tabs.create({ url: `https://${alias}/` });
-  }, {
-    "aria-label": `Open https://${alias}/`,
+  // Only plain host names can be opened. Wildcard patterns and names with other characters cannot.
+  const plain = isPlainHostname(alias);
+  const open = button("Open", "btn btn-small", () => openUrl(`https://${alias}/`), {
+    "aria-label": `Open ${alias}`,
     "data-focus": `open:${alias}`,
   });
-  open.disabled = wildcard;
-  if (wildcard) open.title = "Wildcard aliases cannot be opened.";
+  open.disabled = !plain;
+  if (!plain) open.title = "Only plain host names can be opened.";
 
   const actions = el("div", "alias-actions");
   actions.append(copy, open);
   const row = el("li", "alias");
   row.append(el("code", "alias-name", alias), actions);
   return row;
+}
+
+function openUrl(url: string): void {
+  if (!isHttpUrl(url)) {
+    localError = "That address cannot be opened.";
+    render(true);
+    return;
+  }
+  chrome.tabs.create({ url }).catch((err: unknown) => {
+    localError = `Could not open the page. ${describeError(err)}`;
+    render(true);
+  });
 }
 
 async function copyText(target: HTMLButtonElement, text: string): Promise<void> {
@@ -472,12 +547,11 @@ function footer(state: State): HTMLElement {
     el("div", "", state.user?.email ?? ""),
     el("div", "muted", state.server ?? ""),
   );
-  footerEl.append(
-    who,
-    button("Log out", "btn btn-small", () => act({ action: "logout" }), {
-      "data-focus": "logout",
-    }),
-  );
+  const logout = button("Log out", "btn btn-small", () => act("logout", { action: "logout" }), {
+    "data-focus": "logout",
+  });
+  logout.disabled = isBusy("logout");
+  footerEl.append(who, logout);
   return footerEl;
 }
 

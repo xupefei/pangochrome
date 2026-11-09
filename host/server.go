@@ -822,6 +822,18 @@ func (s *server) state() stateView {
 	default:
 		v.Phase = "connected"
 	}
+	// The choice is reported in every phase, so that the extension keeps
+	// failing closed for all traffic after a session ends.
+	if s.acct != nil {
+		if choice := s.acct.ExitNodes[s.acct.OrgID]; choice.SiteResourceID != 0 {
+			id := choice.SiteResourceID
+			v.ExitNode = &exitNodeView{
+				SiteResourceID: id,
+				Name:           choice.Name,
+				Active:         v.Phase == "connected" && ts.gatewayActive && ts.gatewayID == id,
+			}
+		}
+	}
 	if v.Phase == "loggedOut" || v.Phase == "loggingIn" {
 		return v
 	}
@@ -837,14 +849,6 @@ func (s *server) state() stateView {
 	}
 	if v.Phase == "connected" {
 		v.Routes = ts.routes
-	}
-	if choice := s.acct.ExitNodes[s.acct.OrgID]; choice.SiteResourceID != 0 {
-		id := choice.SiteResourceID
-		v.ExitNode = &exitNodeView{
-			SiteResourceID: id,
-			Name:           choice.Name,
-			Active:         v.Phase == "connected" && ts.gatewayActive && ts.gatewayID == id,
-		}
 	}
 	return v
 }

@@ -1,6 +1,6 @@
-// Portions adapted from tailchrome (https://github.com/dantraynor/tailchrome), MIT licence, Copyright (c) 2026 Tesseras.
+// Portions adapted from tailchrome (https://github.com/dantraynor/tailchrome), MIT licence, Copyright (c) 2026 Tesseras. See static/THIRD_PARTY_NOTICES.txt.
 
-import type { Command, CommandResult, State } from "./protocol";
+import { isState, type Command, type CommandResult, type State } from "./protocol";
 
 /** The subset of chrome.runtime.Port that this client uses. */
 export interface NativePort {
@@ -29,11 +29,14 @@ export interface NativeClientOptions {
   requestTimeoutMs?: number;
   reconnectBaseMs?: number;
   reconnectMaxMs?: number;
+  /** A port that stays open this long resets the reconnect backoff. */
+  stableMs?: number;
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_RECONNECT_BASE_MS = 1_000;
 const DEFAULT_RECONNECT_MAX_MS = 30_000;
+const DEFAULT_STABLE_MS = 30_000;
 
 interface PendingRequest {
   resolve: (result: unknown) => void;
@@ -50,6 +53,7 @@ export class NativeClient {
   private nextId = 1;
   private readonly pending = new Map<number, PendingRequest>();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private stableTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly connectPort: (hostName: string) => NativePort;
   private readonly readLastError: () => string;
   private readonly hostName: string;
@@ -57,6 +61,7 @@ export class NativeClient {
   private readonly requestTimeoutMs: number;
   private readonly reconnectBaseMs: number;
   private readonly reconnectMaxMs: number;
+  private readonly stableMs: number;
   private backoffMs: number;
 
   constructor(options: NativeClientOptions) {
@@ -67,6 +72,7 @@ export class NativeClient {
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.reconnectBaseMs = options.reconnectBaseMs ?? DEFAULT_RECONNECT_BASE_MS;
     this.reconnectMaxMs = options.reconnectMaxMs ?? DEFAULT_RECONNECT_MAX_MS;
+    this.stableMs = options.stableMs ?? DEFAULT_STABLE_MS;
     this.backoffMs = this.reconnectBaseMs;
   }
 
@@ -79,6 +85,7 @@ export class NativeClient {
   /** Closes the current port, if any, and opens a new one now. */
   restart(): void {
     this.clearReconnectTimer();
+    this.clearStableTimer();
     const port = this.port;
     this.port = null;
     this.backoffMs = this.reconnectBaseMs;
@@ -87,10 +94,7 @@ export class NativeClient {
     this.open();
   }
 
-  request<C extends Command>(
-    command: C,
-    timeoutMs: number = this.requestTimeoutMs,
-  ): Promise<CommandResult<C["cmd"]>> {
+  request<C extends Command>(command: C): Promise<CommandResult<C["cmd"]>> {
     const port = this.port;
     if (!port) return Promise.reject(new Error("The helper is not running."));
     const id = this.nextId++;
@@ -98,7 +102,7 @@ export class NativeClient {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error("The helper did not reply in time."));
-      }, timeoutMs);
+      }, this.requestTimeoutMs);
       this.pending.set(id, {
         resolve: resolve as (result: unknown) => void,
         reject,
@@ -130,13 +134,15 @@ export class NativeClient {
       if (this.port === port) this.handleMessage(message);
     });
     port.onDisconnect.addListener(() => this.handleDisconnect(port));
+    this.stableTimer = setTimeout(() => {
+      this.stableTimer = null;
+      this.backoffMs = this.reconnectBaseMs;
+    }, this.stableMs);
     this.onEvent({ type: "open" });
   }
 
   private handleMessage(message: unknown): void {
     if (!isRecord(message)) return;
-    // A valid message means the helper runs, so the next reconnect starts from the base delay.
-    this.backoffMs = this.reconnectBaseMs;
     if (typeof message["id"] === "number") {
       const entry = this.settle(message["id"]);
       if (!entry) return;
@@ -150,8 +156,13 @@ export class NativeClient {
       }
       return;
     }
-    if (message["event"] === "state" && isRecord(message["state"])) {
-      this.onEvent({ type: "state", state: message["state"] as unknown as State });
+    if (message["event"] === "state") {
+      const state = message["state"];
+      if (isState(state)) {
+        this.onEvent({ type: "state", state });
+      } else {
+        console.warn("[pangochrome] Dropped a state event that failed validation.");
+      }
     }
   }
 
@@ -159,6 +170,7 @@ export class NativeClient {
     if (this.port !== port) return;
     const lastError = this.readLastError();
     this.port = null;
+    this.clearStableTimer();
     this.rejectAll("The helper stopped.");
     this.onEvent({ type: "closed", failure: classifyDisconnect(lastError) });
     this.scheduleReconnect();
@@ -177,6 +189,11 @@ export class NativeClient {
   private clearReconnectTimer(): void {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
+  }
+
+  private clearStableTimer(): void {
+    if (this.stableTimer) clearTimeout(this.stableTimer);
+    this.stableTimer = null;
   }
 
   private settle(id: number): PendingRequest | undefined {
