@@ -1,0 +1,28 @@
+//go:build android
+
+package olm
+
+import "net/netip"
+
+// SetupDNSOverride is a no-op on Android
+// Android handles DNS through the VpnService API at the Java/Kotlin layer
+func SetupDNSOverride(interfaceName string, proxyIp netip.Addr) error {
+	return nil
+}
+
+// RestoreDNSOverride is a no-op on Android
+func RestoreDNSOverride() error {
+	return nil
+}
+
+// CleanupStaleState is a no-op on Android as DNS configuration is handled by the VpnService API
+func CleanupStaleState(interfaceName string) error {
+	_ = interfaceName
+	return nil
+}
+
+// ForceResetDNS is a no-op on Android.
+func ForceResetDNS(interfaceName string) error {
+	_ = interfaceName
+	return nil
+}

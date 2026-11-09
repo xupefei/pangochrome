@@ -1,0 +1,87 @@
+package peers
+
+// PeerAction represents a request to add, update, or remove a peer
+type PeerAction struct {
+	Action   string     `json:"action"`   // "add", "update", or "remove"
+	SiteInfo SiteConfig `json:"siteInfo"` // Site configuration information
+}
+
+// UpdatePeerData represents the data needed to update a peer
+type SiteConfig struct {
+	SiteId         int      `json:"siteId"`
+	Name           string   `json:"name,omitempty"`
+	Endpoint       string   `json:"endpoint,omitempty"`
+	LocalEndpoints []string `json:"localEndpoints,omitempty"` // optional, ip:port endpoints on the site host's local network interfaces, ordered best-to-worst
+	RelayEndpoint  string   `json:"relayEndpoint,omitempty"`
+	PublicKey      string   `json:"publicKey,omitempty"`
+	ServerIP       string   `json:"serverIP,omitempty"`
+	ServerPort     uint16   `json:"serverPort,omitempty"`
+	RemoteSubnets  []string `json:"remoteSubnets,omitempty"` // optional, array of subnets that this site can access
+	AllowedIps     []string `json:"allowedIps,omitempty"`    // optional, array of allowed IPs for the peer
+	Aliases        []Alias  `json:"aliases,omitempty"`       // optional, array of alias configurations
+
+	// ActiveLocalEndpoint tracks the local network endpoint currently in use for this
+	// peer, if any. Not part of the wire protocol; set internally by the PeerManager.
+	ActiveLocalEndpoint string `json:"-"`
+}
+
+type Alias struct {
+	Alias        string `json:"alias"`        // the alias name
+	AliasAddress string `json:"aliasAddress"` // the alias IP address
+}
+
+// RemovePeer represents the data needed to remove a peer
+type PeerRemove struct {
+	SiteId int `json:"siteId"`
+}
+
+// RelayPeerData represents the server's acknowledgement of an "olm/wg/relay" message. The
+// server replies in kind: SiteId/RelayEndpoint for a single-site request, or the parallel
+// SiteIds/RelayEndpoints arrays for a batched one (RelayPort is shared by the whole batch).
+type RelayPeerData struct {
+	SiteId        int    `json:"siteId,omitempty"`
+	RelayEndpoint string `json:"relayEndpoint,omitempty"`
+	RelayPort     uint16 `json:"relayPort"`
+
+	SiteIds        []int    `json:"siteIds,omitempty"`
+	RelayEndpoints []string `json:"relayEndpoints,omitempty"`
+}
+
+// UnRelayPeerData represents the server's acknowledgement of an "olm/wg/unrelay" message,
+// in either its single-site or batched (parallel-array) form. See RelayPeerData.
+type UnRelayPeerData struct {
+	SiteId   int    `json:"siteId,omitempty"`
+	Endpoint string `json:"endpoint,omitempty"`
+
+	SiteIds   []int    `json:"siteIds,omitempty"`
+	Endpoints []string `json:"endpoints,omitempty"`
+}
+
+// LocalPeerAckData represents the server's acknowledgement of an "olm/wg/local" or
+// "olm/wg/unlocal" message. olm has already applied the local connection switch by the time
+// it sends the notification, so the ack is only used to stop the retry sender.
+type LocalPeerAckData struct {
+	SiteId int `json:"siteId"`
+}
+
+// PeerAdd represents the data needed to add remote subnets to a peer
+type PeerAdd struct {
+	SiteId        int      `json:"siteId"`
+	RemoteSubnets []string `json:"remoteSubnets"`     // subnets to add
+	Aliases       []Alias  `json:"aliases,omitempty"` // aliases to add
+}
+
+// RemovePeerData represents the data needed to remove remote subnets from a peer
+type RemovePeerData struct {
+	SiteId        int      `json:"siteId"`
+	RemoteSubnets []string `json:"remoteSubnets"`     // subnets to remove
+	Aliases       []Alias  `json:"aliases,omitempty"` // aliases to remove
+}
+
+type UpdatePeerData struct {
+	SiteId           int      `json:"siteId"`
+	OldRemoteSubnets []string `json:"oldRemoteSubnets"`     // old list of remote subnets
+	NewRemoteSubnets []string `json:"newRemoteSubnets"`     // new list of remote subnets
+	OldAliases       []Alias  `json:"oldAliases,omitempty"` // old list of aliases
+	NewAliases       []Alias  `json:"newAliases,omitempty"` // new list of aliases
+}

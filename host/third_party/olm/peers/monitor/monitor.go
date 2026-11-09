@@ -1,0 +1,1504 @@
+package monitor
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/binary"
+	"encoding/hex"
+	"fmt"
+	"net"
+	"net/netip"
+	"sync"
+	"time"
+
+	"github.com/fosrl/newt/bind"
+	"github.com/fosrl/newt/holepunch"
+	"github.com/fosrl/newt/logger"
+	"github.com/fosrl/newt/util"
+	"github.com/fosrl/olm/api"
+	middleDevice "github.com/fosrl/olm/device"
+	"github.com/fosrl/olm/websocket"
+	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/icmp"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
+)
+
+// PeerMonitor handles monitoring the connection status to multiple WireGuard peers
+type PeerMonitor struct {
+	monitors    map[int]*Client
+	mutex       sync.Mutex
+	running     bool
+	timeout     time.Duration
+	maxAttempts int
+	wsClient    *websocket.Client
+	publicDNS   []string
+
+	// Relay sender tracking — batched per message type so many relay/unrelay decisions
+	// arriving together (e.g. after a network-wide blip) go out as one websocket message.
+	relayBatch   *batchSender
+	unrelayBatch *batchSender
+
+	// Netstack fields
+	middleDev   *middleDevice.MiddleDevice
+	localIP     string
+	stack       *stack.Stack
+	ep          *channel.Endpoint
+	activePorts map[uint16]bool
+	portsLock   sync.RWMutex
+	nsCtx       context.Context
+	nsCancel    context.CancelFunc
+	nsWg        sync.WaitGroup
+
+	// Holepunch testing fields
+	sharedBind          *bind.SharedBind
+	holepunchTester     *holepunch.HolepunchTester
+	holepunchTimeout    time.Duration
+	holepunchEndpoints  map[int]string // siteID -> endpoint for holepunch testing
+	holepunchStatus     map[int]bool   // siteID -> connected status
+	holepunchStopChan   chan struct{}
+	holepunchUpdateChan chan struct{}
+
+	// Relay tracking fields
+	relayedPeers         map[int]bool // siteID -> whether the peer is currently relayed
+	holepunchMaxAttempts int          // max consecutive failures before triggering relay
+	holepunchFailures    map[int]int  // siteID -> consecutive failure count
+
+	// Local endpoint testing fields. Local endpoints are ip:port addresses on the
+	// site host's local network interfaces (ordered best-to-worst by the server).
+	// When one is reachable it takes priority over both the public endpoint and
+	// the relay.
+	localEndpoints      map[int][]string // siteID -> ordered candidate local endpoints
+	localActiveEndpoint map[int]string   // siteID -> currently active local endpoint ("" = not using local)
+	localFailures       map[int]int      // siteID -> consecutive failures of the active local endpoint
+	localTestTimeout    time.Duration    // timeout for each local endpoint probe
+
+	// Local connection switch callbacks, set by the PeerManager
+	localSwitchCallback   func(siteId int, endpoint string) // invoked when a local endpoint becomes active
+	localFallbackCallback func(siteId int)                  // invoked when we fall back from a local endpoint
+
+	// Local connection sender tracking (informational messages only), batched the same way.
+	localBatch   *batchSender
+	unlocalBatch *batchSender
+
+	// Exponential backoff fields for holepunch monitor
+	defaultHolepunchMinInterval time.Duration // Minimum interval (initial)
+	defaultHolepunchMaxInterval time.Duration
+	holepunchMinInterval        time.Duration // Minimum interval (initial)
+	holepunchMaxInterval        time.Duration // Maximum interval (cap for backoff)
+	holepunchBackoffMultiplier  float64       // Multiplier for each stable check
+	holepunchStableCount        map[int]int   // siteID -> consecutive stable status count
+	holepunchCurrentInterval    time.Duration // Current interval with backoff applied
+
+	// Rapid initial test fields
+	rapidTestInterval    time.Duration // interval between rapid test attempts
+	rapidTestTimeout     time.Duration // timeout for each rapid test attempt
+	rapidTestMaxAttempts int           // max attempts during rapid test phase
+
+	// API server for status updates
+	apiServer *api.API
+
+	// WG connection status tracking
+	wgConnectionStatus   map[int]bool          // siteID -> WG connected status
+	wgConnectionRTT      map[int]time.Duration // siteID -> last known RTT
+	statusChangeCallback func(siteId int)      // called when any peer's connection status changes
+
+	// Exit node ICMP monitoring fields. The exit node is a single peer (not a
+	// site), pinged over the same gvisor netstack used for the peer UDP tests
+	// above, so the probe never touches the host's real network stack - it's
+	// injected directly into the WireGuard device via MiddleDevice.
+	exitNodeMu       sync.Mutex
+	exitNodeServerIP string
+	exitNodeTunnelIP string
+	exitNodeCancel   context.CancelFunc
+
+	// activeICMPIdents tracks the ICMP identifiers of our own in-flight exit-node
+	// ping probes (guarded by portsLock, alongside activePorts), so handlePacket
+	// only intercepts Echo Replies that are actually ours.
+	activeICMPIdents map[uint16]bool
+}
+
+// NewPeerMonitor creates a new peer monitor with the given callback
+func generateChainId() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func NewPeerMonitor(wsClient *websocket.Client, middleDev *middleDevice.MiddleDevice, localIP string, sharedBind *bind.SharedBind, apiServer *api.API, publicDNS []string) *PeerMonitor {
+	ctx, cancel := context.WithCancel(context.Background())
+	pm := &PeerMonitor{
+		monitors:             make(map[int]*Client),
+		timeout:              3 * time.Second,
+		maxAttempts:          3,
+		wsClient:             wsClient,
+		middleDev:            middleDev,
+		localIP:              localIP,
+		publicDNS:            publicDNS,
+		activePorts:          make(map[uint16]bool),
+		activeICMPIdents:     make(map[uint16]bool),
+		nsCtx:                ctx,
+		nsCancel:             cancel,
+		sharedBind:           sharedBind,
+		holepunchTimeout:     2 * time.Second, // Faster timeout
+		holepunchEndpoints:   make(map[int]string),
+		holepunchStatus:      make(map[int]bool),
+		relayedPeers:         make(map[int]bool),
+		relayBatch:           newBatchSender(wsClient, "olm/wg/relay"),
+		unrelayBatch:         newBatchSender(wsClient, "olm/wg/unrelay"),
+		holepunchMaxAttempts: 3, // Trigger relay after 3 consecutive failures
+		holepunchFailures:    make(map[int]int),
+		localEndpoints:       make(map[int][]string),
+		localActiveEndpoint:  make(map[int]string),
+		localFailures:        make(map[int]int),
+		localTestTimeout:     300 * time.Millisecond, // local network round trips should be fast
+		localBatch:           newBatchSender(wsClient, "olm/wg/local"),
+		unlocalBatch:         newBatchSender(wsClient, "olm/wg/unlocal"),
+		// Rapid initial test settings: complete within ~1.5 seconds
+		rapidTestInterval:    200 * time.Millisecond, // 200ms between attempts
+		rapidTestTimeout:     400 * time.Millisecond, // 400ms timeout per attempt
+		rapidTestMaxAttempts: 5,                      // 5 attempts = ~1-1.5 seconds total
+		apiServer:            apiServer,
+		wgConnectionStatus:   make(map[int]bool),
+		wgConnectionRTT:      make(map[int]time.Duration),
+		// Exponential backoff settings for holepunch monitor
+		defaultHolepunchMinInterval: 2 * time.Second,
+		defaultHolepunchMaxInterval: 30 * time.Second,
+		holepunchMinInterval:        2 * time.Second,
+		holepunchMaxInterval:        30 * time.Second,
+		holepunchBackoffMultiplier:  1.5,
+		holepunchStableCount:        make(map[int]int),
+		holepunchCurrentInterval:    2 * time.Second,
+		holepunchUpdateChan:         make(chan struct{}, 1),
+	}
+
+	if err := pm.initNetstack(); err != nil {
+		logger.Error("Failed to initialize netstack for peer monitor: %v", err)
+	}
+
+	// Initialize holepunch tester if sharedBind is available
+	if sharedBind != nil {
+		pm.holepunchTester = holepunch.NewHolepunchTester(sharedBind, publicDNS)
+	}
+
+	return pm
+}
+
+// SetPublicDNS replaces the DNS servers used to resolve peer endpoints and
+// hole-punch exit nodes.  The servers must be in "host:port" format.
+func (pm *PeerMonitor) SetPublicDNS(servers []string) {
+	pm.mutex.Lock()
+	pm.publicDNS = servers
+	tester := pm.holepunchTester
+	pm.mutex.Unlock()
+
+	if tester != nil {
+		tester.SetPublicDNS(servers)
+	}
+}
+
+// SetInterval changes how frequently peers are checked
+func (pm *PeerMonitor) SetPeerInterval(minInterval, maxInterval time.Duration) {
+	pm.mutex.Lock()
+	defer pm.mutex.Unlock()
+
+	// Update interval for all existing monitors
+	for _, client := range pm.monitors {
+		client.SetPacketInterval(minInterval, maxInterval)
+	}
+
+	logger.Info("Set peer monitor interval to min: %s, max: %s", minInterval, maxInterval)
+}
+
+func (pm *PeerMonitor) ResetPeerInterval() {
+	pm.mutex.Lock()
+	defer pm.mutex.Unlock()
+
+	// Update interval for all existing monitors
+	for _, client := range pm.monitors {
+		client.ResetPacketInterval()
+	}
+}
+
+// SetPeerHolepunchInterval sets both the minimum and maximum intervals for holepunch monitoring
+func (pm *PeerMonitor) SetPeerHolepunchInterval(minInterval, maxInterval time.Duration) {
+	pm.mutex.Lock()
+	pm.holepunchMinInterval = minInterval
+	pm.holepunchMaxInterval = maxInterval
+	// Reset current interval to the new minimum
+	pm.holepunchCurrentInterval = minInterval
+	updateChan := pm.holepunchUpdateChan
+	pm.mutex.Unlock()
+
+	logger.Info("Set holepunch interval to min: %s, max: %s", minInterval, maxInterval)
+
+	// Signal the goroutine to apply the new interval if running
+	if updateChan != nil {
+		select {
+		case updateChan <- struct{}{}:
+		default:
+			// Channel full or closed, skip
+		}
+	}
+}
+
+// GetPeerHolepunchIntervals returns the current minimum and maximum intervals for holepunch monitoring
+func (pm *PeerMonitor) GetPeerHolepunchIntervals() (minInterval, maxInterval time.Duration) {
+	pm.mutex.Lock()
+	defer pm.mutex.Unlock()
+
+	return pm.holepunchMinInterval, pm.holepunchMaxInterval
+}
+
+func (pm *PeerMonitor) ResetPeerHolepunchInterval() {
+	pm.mutex.Lock()
+	pm.holepunchMinInterval = pm.defaultHolepunchMinInterval
+	pm.holepunchMaxInterval = pm.defaultHolepunchMaxInterval
+	pm.holepunchCurrentInterval = pm.defaultHolepunchMinInterval
+	updateChan := pm.holepunchUpdateChan
+	pm.mutex.Unlock()
+
+	logger.Info("Reset holepunch interval to defaults: min=%v, max=%v", pm.defaultHolepunchMinInterval, pm.defaultHolepunchMaxInterval)
+
+	// Signal the goroutine to apply the new interval if running
+	if updateChan != nil {
+		select {
+		case updateChan <- struct{}{}:
+		default:
+			// Channel full or closed, skip
+		}
+	}
+}
+
+// AddPeer adds a new peer to monitor
+func (pm *PeerMonitor) AddPeer(siteID int, endpoint string, holepunchEndpoint string, localEndpoints []string) error {
+	pm.mutex.Lock()
+	defer pm.mutex.Unlock()
+
+	if _, exists := pm.monitors[siteID]; exists {
+		return nil // Already monitoring
+	}
+
+	// Use our custom dialer that uses netstack
+	client, err := NewClient(endpoint, pm.dial)
+	if err != nil {
+		return err
+	}
+
+	pm.monitors[siteID] = client
+
+	pm.holepunchEndpoints[siteID] = holepunchEndpoint
+	pm.holepunchStatus[siteID] = false // Initially unknown/disconnected
+	pm.localEndpoints[siteID] = localEndpoints
+	pm.localActiveEndpoint[siteID] = ""
+	pm.localFailures[siteID] = 0
+
+	if pm.running {
+		if err := client.StartMonitor(func(status ConnectionStatus) {
+			pm.handleConnectionStatusChange(siteID, status)
+		}); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// update holepunch endpoint for a peer
+func (pm *PeerMonitor) UpdateHolepunchEndpoint(siteID int, endpoint string) {
+	// Short delay to allow WireGuard peer reconfiguration to complete
+	// The NAT mapping refresh is handled separately by TriggerHolePunch in olm.go
+	pm.mutex.Lock()
+	defer pm.mutex.Unlock()
+	pm.holepunchEndpoints[siteID] = endpoint
+	logger.Debug("Updated holepunch endpoint for site %d to %s", siteID, endpoint)
+}
+
+// UpdateLocalEndpoints updates the candidate local endpoints for a peer
+func (pm *PeerMonitor) UpdateLocalEndpoints(siteID int, localEndpoints []string) {
+	pm.mutex.Lock()
+	defer pm.mutex.Unlock()
+	pm.localEndpoints[siteID] = localEndpoints
+	logger.Debug("Updated local endpoints for site %d: %v", siteID, localEndpoints)
+}
+
+// SetLocalConnectionCallbacks registers the callbacks invoked when a peer switches to
+// or falls back from a local network endpoint. onLocal is called with the endpoint that
+// became active; onFallback is called when we give up on the active local endpoint and
+// resume the normal public/relay monitoring logic.
+func (pm *PeerMonitor) SetLocalConnectionCallbacks(onLocal func(siteId int, endpoint string), onFallback func(siteId int)) {
+	pm.mutex.Lock()
+	defer pm.mutex.Unlock()
+	pm.localSwitchCallback = onLocal
+	pm.localFallbackCallback = onFallback
+}
+
+// RapidTestPeer performs a rapid connectivity test for a newly added peer.
+// This is designed to quickly determine if holepunch is viable within ~1-2 seconds.
+// Returns true if the connection is viable (holepunch works), false if it should relay.
+func (pm *PeerMonitor) RapidTestPeer(siteID int, endpoint string) bool {
+	if pm.holepunchTester == nil {
+		logger.Warn("Cannot perform rapid test: holepunch tester not initialized")
+		return false
+	}
+
+	pm.mutex.Lock()
+	interval := pm.rapidTestInterval
+	timeout := pm.rapidTestTimeout
+	maxAttempts := pm.rapidTestMaxAttempts
+	pm.mutex.Unlock()
+
+	logger.Info("Starting rapid holepunch test for site %d at %s (max %d attempts, %v timeout each)",
+		siteID, endpoint, maxAttempts, timeout)
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		result := pm.holepunchTester.TestEndpoint(endpoint, timeout)
+
+		if result.Success {
+			logger.Info("Rapid test: site %d holepunch SUCCEEDED on attempt %d (RTT: %v)",
+				siteID, attempt, result.RTT)
+
+			// Update status
+			pm.mutex.Lock()
+			pm.holepunchStatus[siteID] = true
+			pm.holepunchFailures[siteID] = 0
+			pm.mutex.Unlock()
+
+			return true
+		}
+
+		if attempt < maxAttempts {
+			time.Sleep(interval)
+		}
+	}
+
+	logger.Warn("Rapid test: site %d holepunch FAILED after %d attempts, will relay",
+		siteID, maxAttempts)
+
+	// Update status to reflect failure
+	pm.mutex.Lock()
+	pm.holepunchStatus[siteID] = false
+	pm.holepunchFailures[siteID] = maxAttempts
+	pm.mutex.Unlock()
+
+	return false
+}
+
+// RapidTestLocalEndpoints performs a rapid connectivity test of local candidate endpoints
+// for a newly added peer, so local viability is known within the same ~1-2 second window as
+// RapidTestPeer's public-endpoint test (rather than waiting for the next backoff-loop tick,
+// which could be tens of seconds away). Candidates are tried in order (best-to-worst) and
+// the first reachable one wins. Returns the winning endpoint, or "" if none are reachable.
+func (pm *PeerMonitor) RapidTestLocalEndpoints(siteID int, endpoints []string) string {
+	if pm.holepunchTester == nil || len(endpoints) == 0 {
+		return ""
+	}
+
+	pm.mutex.Lock()
+	timeout := pm.rapidTestTimeout
+	pm.mutex.Unlock()
+
+	for _, endpoint := range endpoints {
+		result := pm.holepunchTester.TestEndpoint(endpoint, timeout)
+		if !result.Success {
+			continue
+		}
+
+		logger.Info("Rapid test: local endpoint %s for site %d SUCCEEDED (RTT: %v)", endpoint, siteID, result.RTT)
+
+		pm.mutex.Lock()
+		// Peer may have been removed while we were testing.
+		stillTracked := false
+		if _, tracked := pm.localEndpoints[siteID]; tracked {
+			stillTracked = true
+			pm.localActiveEndpoint[siteID] = endpoint
+			pm.localFailures[siteID] = 0
+		}
+		pm.mutex.Unlock()
+
+		if stillTracked {
+			pm.sendLocal(siteID, endpoint)
+		}
+
+		return endpoint
+	}
+
+	logger.Info("Rapid test: no local endpoint reachable for site %d", siteID)
+	return ""
+}
+
+// remainingLocalCandidates returns all of endpoints except exclude, preserving order.
+func remainingLocalCandidates(endpoints []string, exclude string) []string {
+	remaining := make([]string, 0, len(endpoints))
+	for _, ep := range endpoints {
+		if ep != exclude {
+			remaining = append(remaining, ep)
+		}
+	}
+	return remaining
+}
+
+// rapidTestOnLocalFallback runs a fast (~1-2 second) test of the public endpoint, racing it
+// against any remaining untried local candidates, immediately after we fall back from a dead
+// active local endpoint. Without this, the peer would sit on the public endpoint - which may
+// itself be unreachable - relying on the normal checkHolepunchEndpoints loop to notice, which
+// can take tens of seconds if the holepunch backoff interval had climbed while the local
+// endpoint was stable. If neither the public endpoint nor a local candidate is reachable, relay
+// is requested immediately. Mirrors PeerManager.performRapidInitialTest's race, but is triggered
+// by local-endpoint failure rather than initial peer setup.
+func (pm *PeerMonitor) rapidTestOnLocalFallback(siteID int, publicEndpoint string, remainingLocal []string) {
+	if pm.holepunchTester == nil {
+		return
+	}
+
+	var wg sync.WaitGroup
+	var localWinner string
+	var holepunchViable bool
+
+	if len(remainingLocal) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			localWinner = pm.RapidTestLocalEndpoints(siteID, remainingLocal)
+		}()
+	}
+
+	if publicEndpoint != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			holepunchViable = pm.RapidTestPeer(siteID, publicEndpoint)
+		}()
+	}
+
+	wg.Wait()
+
+	pm.mutex.Lock()
+	_, stillTracked := pm.localEndpoints[siteID]
+	winnerStillActive := pm.localActiveEndpoint[siteID] == localWinner
+	switchCb := pm.localSwitchCallback
+	pm.mutex.Unlock()
+
+	if !stillTracked {
+		return // peer was removed while we were testing
+	}
+
+	if localWinner != "" {
+		// RapidTestLocalEndpoints already recorded the new active endpoint and notified the
+		// server, but doesn't move the WireGuard peer itself - do that here, unless a
+		// concurrent checkLocalEndpoints tick has since activated a different endpoint.
+		if winnerStillActive && switchCb != nil {
+			switchCb(siteID, localWinner)
+		}
+		logger.Info("Rapid fallback test: local connection %s viable for site %d", localWinner, siteID)
+		return
+	}
+
+	if !holepunchViable {
+		logger.Warn("Rapid fallback test: site %d unreachable on public endpoint after local fallback, requesting relay", siteID)
+		if pm.wsClient != nil {
+			pm.sendRelay(siteID)
+		}
+	} else {
+		logger.Info("Rapid fallback test: site %d reachable on public endpoint after local fallback", siteID)
+	}
+}
+
+// UpdatePeerEndpoint updates the monitor endpoint for a peer
+func (pm *PeerMonitor) UpdatePeerEndpoint(siteID int, monitorPeer string) {
+	pm.mutex.Lock()
+	defer pm.mutex.Unlock()
+
+	client, exists := pm.monitors[siteID]
+	if !exists {
+		logger.Warn("Cannot update endpoint: peer %d not found in monitor", siteID)
+		return
+	}
+
+	// Update the client's server address
+	client.UpdateServerAddr(monitorPeer)
+
+	logger.Info("Updated monitor endpoint for site %d to %s", siteID, monitorPeer)
+}
+
+// removePeerUnlocked stops monitoring a peer and removes it from the monitor
+// This function assumes the mutex is already held by the caller
+func (pm *PeerMonitor) removePeerUnlocked(siteID int) {
+	client, exists := pm.monitors[siteID]
+	if !exists {
+		return
+	}
+
+	client.StopMonitor()
+	client.Close()
+	delete(pm.monitors, siteID)
+}
+
+// RemovePeer stops monitoring a peer and removes it from the monitor
+func (pm *PeerMonitor) RemovePeer(siteID int) {
+	pm.mutex.Lock()
+
+	// remove the holepunch endpoint info
+	delete(pm.holepunchEndpoints, siteID)
+	delete(pm.holepunchStatus, siteID)
+	delete(pm.relayedPeers, siteID)
+	delete(pm.holepunchFailures, siteID)
+	delete(pm.localEndpoints, siteID)
+	delete(pm.localActiveEndpoint, siteID)
+	delete(pm.localFailures, siteID)
+
+	pm.removePeerUnlocked(siteID)
+	pm.mutex.Unlock()
+}
+
+func (pm *PeerMonitor) RemoveHolepunchEndpoint(siteID int) {
+	pm.mutex.Lock()
+	defer pm.mutex.Unlock()
+	delete(pm.holepunchEndpoints, siteID)
+}
+
+// Start begins monitoring all peers
+func (pm *PeerMonitor) Start() {
+	pm.mutex.Lock()
+	defer pm.mutex.Unlock()
+
+	if pm.running {
+		return // Already running
+	}
+
+	pm.running = true
+
+	// Start monitoring all peers
+	for siteID, client := range pm.monitors {
+		siteIDCopy := siteID // Create a copy for the closure
+		err := client.StartMonitor(func(status ConnectionStatus) {
+			pm.handleConnectionStatusChange(siteIDCopy, status)
+		})
+		if err != nil {
+			logger.Error("Failed to start monitoring peer %d: %v\n", siteID, err)
+			continue
+		}
+		logger.Info("Started monitoring peer %d\n", siteID)
+	}
+
+	pm.startHolepunchMonitor()
+}
+
+// handleConnectionStatusChange is called when a peer's connection status changes
+func (pm *PeerMonitor) handleConnectionStatusChange(siteID int, status ConnectionStatus) {
+	pm.mutex.Lock()
+	previousStatus, exists := pm.wgConnectionStatus[siteID]
+	pm.wgConnectionStatus[siteID] = status.Connected
+	if status.Connected && status.RTT > 0 {
+		pm.wgConnectionRTT[siteID] = status.RTT
+	}
+	isRelayed := pm.relayedPeers[siteID]
+	localEndpoint := pm.localActiveEndpoint[siteID]
+	endpoint := pm.holepunchEndpoints[siteID]
+	pm.mutex.Unlock()
+
+	isLocal := localEndpoint != ""
+	if isLocal {
+		// Report the active local endpoint rather than the public one; local and relay
+		// are mutually exclusive.
+		endpoint = localEndpoint
+		isRelayed = false
+	}
+
+	// Log status changes
+	if !exists || previousStatus != status.Connected {
+		if status.Connected {
+			logger.Info("WireGuard connection to site %d is CONNECTED (RTT: %v)", siteID, status.RTT)
+		} else {
+			logger.Warn("WireGuard connection to site %d is DISCONNECTED", siteID)
+		}
+	}
+
+	// Update API with connection status
+	if pm.apiServer != nil {
+		pm.apiServer.UpdatePeerStatus(siteID, status.Connected, status.RTT, endpoint, isRelayed, isLocal)
+	}
+
+	// Notify route optimizer of status change
+	if pm.statusChangeCallback != nil {
+		pm.statusChangeCallback(siteID)
+	}
+}
+
+// sendRelay queues a relay message for the server, batched with any other relay decisions
+// made in the same short window, with retry keyed by chainId.
+func (pm *PeerMonitor) sendRelay(siteID int) error {
+	if pm.wsClient == nil {
+		return fmt.Errorf("websocket client is nil")
+	}
+
+	chainId := pm.relayBatch.add(siteID, "")
+
+	logger.Info("Queued relay message for site %d (chain %s)", siteID, chainId)
+	return nil
+}
+
+// RequestRelay is a public method to request relay for a peer.
+// This is used when rapid initial testing determines holepunch is not viable.
+func (pm *PeerMonitor) RequestRelay(siteID int) error {
+	return pm.sendRelay(siteID)
+}
+
+// sendUnRelay queues an unrelay message for the server, batched with any other unrelay
+// decisions made in the same short window, with retry keyed by chainId.
+func (pm *PeerMonitor) sendUnRelay(siteID int) error {
+	if pm.wsClient == nil {
+		return fmt.Errorf("websocket client is nil")
+	}
+
+	chainId := pm.unrelayBatch.add(siteID, "")
+
+	logger.Info("Queued unrelay message for site %d (chain %s)", siteID, chainId)
+	return nil
+}
+
+// sendLocal notifies the server that this peer switched to a local network endpoint, with
+// retry keyed by chainId. This is informational (e.g. so the server can relay the information
+// to newt) - olm does not wait for an acknowledgement before using the local connection, but
+// it does stop retrying once the server acks via CancelLocalSend, same as relay/unrelay.
+func (pm *PeerMonitor) sendLocal(siteID int, endpoint string) {
+	if pm.wsClient == nil {
+		return
+	}
+
+	chainId := pm.localBatch.add(siteID, endpoint)
+
+	logger.Info("Queued local-connection message for site %d (%s, chain %s)", siteID, endpoint, chainId)
+}
+
+// sendUnLocal notifies the server that this peer fell back from its local network endpoint,
+// with retry keyed by chainId.
+func (pm *PeerMonitor) sendUnLocal(siteID int) {
+	if pm.wsClient == nil {
+		return
+	}
+
+	chainId := pm.unlocalBatch.add(siteID, "")
+
+	logger.Info("Queued unlocal-connection message for site %d (chain %s)", siteID, chainId)
+}
+
+// CancelLocalSend removes chainId from the pending local/unlocal batches, if present.
+// If chainId is empty, all pending local-connection items are cleared.
+func (pm *PeerMonitor) CancelLocalSend(chainId string) {
+	if chainId == "" {
+		pm.localBatch.cancelAll()
+		pm.unlocalBatch.cancelAll()
+		logger.Info("Cancelled all local-connection senders")
+		return
+	}
+
+	if pm.localBatch.cancel(chainId) || pm.unlocalBatch.cancel(chainId) {
+		logger.Info("Cancelled local-connection sender for chain %s", chainId)
+	} else {
+		logger.Warn("CancelLocalSend: no active sender for chain %s", chainId)
+	}
+}
+
+// CancelRelaySend removes chainId from the pending relay/unrelay batches, if present.
+// If chainId is empty, all pending relay items are cleared.
+func (pm *PeerMonitor) CancelRelaySend(chainId string) {
+	if chainId == "" {
+		pm.relayBatch.cancelAll()
+		pm.unrelayBatch.cancelAll()
+		logger.Info("Cancelled all relay senders")
+		return
+	}
+
+	if pm.relayBatch.cancel(chainId) || pm.unrelayBatch.cancel(chainId) {
+		logger.Info("Cancelled relay sender for chain %s", chainId)
+	} else {
+		logger.Warn("CancelRelaySend: no active sender for chain %s", chainId)
+	}
+}
+
+// Stop stops monitoring all peers
+func (pm *PeerMonitor) Stop() {
+	// Stop holepunch monitor first (outside of mutex to avoid deadlock)
+	pm.stopHolepunchMonitor()
+
+	pm.mutex.Lock()
+	defer pm.mutex.Unlock()
+
+	if !pm.running {
+		return
+	}
+
+	pm.running = false
+
+	// Stop all monitors
+	for _, client := range pm.monitors {
+		client.StopMonitor()
+	}
+}
+
+// MarkPeerRelayed marks a peer as currently using relay
+func (pm *PeerMonitor) MarkPeerRelayed(siteID int, relayed bool) {
+	pm.mutex.Lock()
+	defer pm.mutex.Unlock()
+	pm.relayedPeers[siteID] = relayed
+	if relayed {
+		// Reset failure count when marked as relayed
+		pm.holepunchFailures[siteID] = 0
+	}
+}
+
+// IsPeerRelayed returns whether a peer is currently using relay
+func (pm *PeerMonitor) IsPeerRelayed(siteID int) bool {
+	pm.mutex.Lock()
+	defer pm.mutex.Unlock()
+	return pm.relayedPeers[siteID]
+}
+
+// SetStatusChangeCallback registers a callback that is invoked whenever a peer's
+// WireGuard connection status changes (connected/disconnected). The callback must
+// be non-blocking (e.g., send to a buffered channel).
+func (pm *PeerMonitor) SetStatusChangeCallback(cb func(siteId int)) {
+	pm.mutex.Lock()
+	defer pm.mutex.Unlock()
+	pm.statusChangeCallback = cb
+}
+
+// GetConnectionQuality returns the current connection quality metrics for a peer.
+func (pm *PeerMonitor) GetConnectionQuality(siteId int) (connected bool, relayed bool, rtt time.Duration) {
+	pm.mutex.Lock()
+	defer pm.mutex.Unlock()
+	connected = pm.wgConnectionStatus[siteId]
+	relayed = pm.relayedPeers[siteId]
+	rtt = pm.wgConnectionRTT[siteId]
+	return
+}
+
+// startHolepunchMonitor starts the holepunch connection monitoring
+// Note: This function assumes the mutex is already held by the caller (called from Start())
+func (pm *PeerMonitor) startHolepunchMonitor() error {
+	if pm.holepunchTester == nil {
+		return fmt.Errorf("holepunch tester not initialized (sharedBind not provided)")
+	}
+
+	if pm.holepunchStopChan != nil {
+		return fmt.Errorf("holepunch monitor already running")
+	}
+
+	if err := pm.holepunchTester.Start(); err != nil {
+		return fmt.Errorf("failed to start holepunch tester: %w", err)
+	}
+
+	pm.holepunchStopChan = make(chan struct{})
+
+	go pm.runHolepunchMonitor()
+
+	logger.Info("Started holepunch connection monitor")
+	return nil
+}
+
+// stopHolepunchMonitor stops the holepunch connection monitoring
+func (pm *PeerMonitor) stopHolepunchMonitor() {
+	pm.mutex.Lock()
+	stopChan := pm.holepunchStopChan
+	pm.holepunchStopChan = nil
+	pm.mutex.Unlock()
+
+	if stopChan != nil {
+		close(stopChan)
+	}
+
+	if pm.holepunchTester != nil {
+		pm.holepunchTester.Stop()
+	}
+
+	logger.Info("Stopped holepunch connection monitor")
+}
+
+// runHolepunchMonitor runs the holepunch monitoring loop with exponential backoff
+func (pm *PeerMonitor) runHolepunchMonitor() {
+	pm.mutex.Lock()
+	pm.holepunchCurrentInterval = pm.holepunchMinInterval
+	pm.mutex.Unlock()
+
+	timer := time.NewTimer(0) // Fire immediately for initial check
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-pm.holepunchStopChan:
+			return
+		case <-pm.holepunchUpdateChan:
+			// Interval settings changed, reset to minimum
+			pm.mutex.Lock()
+			pm.holepunchCurrentInterval = pm.holepunchMinInterval
+			currentInterval := pm.holepunchCurrentInterval
+			pm.mutex.Unlock()
+
+			timer.Reset(currentInterval)
+			logger.Debug("Holepunch monitor interval updated, reset to %v", currentInterval)
+		case <-timer.C:
+			localChanged := pm.checkLocalEndpoints()
+			anyStatusChanged := pm.checkHolepunchEndpoints() || localChanged
+
+			pm.mutex.Lock()
+			if anyStatusChanged {
+				// Reset to minimum interval on any status change
+				pm.holepunchCurrentInterval = pm.holepunchMinInterval
+			} else {
+				// Apply exponential backoff when stable
+				newInterval := time.Duration(float64(pm.holepunchCurrentInterval) * pm.holepunchBackoffMultiplier)
+				if newInterval > pm.holepunchMaxInterval {
+					newInterval = pm.holepunchMaxInterval
+				}
+				pm.holepunchCurrentInterval = newInterval
+			}
+			currentInterval := pm.holepunchCurrentInterval
+			pm.mutex.Unlock()
+
+			timer.Reset(currentInterval)
+		}
+	}
+}
+
+// checkLocalEndpoints tests local network endpoints for sites that have them configured.
+// For a site not currently using a local endpoint, it probes each candidate in order
+// (candidates are ordered best-to-worst by the server) and switches to the first one that
+// succeeds. For a site already using a local endpoint, it re-tests that endpoint and falls
+// back to the normal public/relay logic after a few consecutive failures.
+// Returns true if any site's local-connection status changed.
+func (pm *PeerMonitor) checkLocalEndpoints() bool {
+	pm.mutex.Lock()
+	if !pm.running {
+		pm.mutex.Unlock()
+		return false
+	}
+	if pm.holepunchTester == nil {
+		pm.mutex.Unlock()
+		return false
+	}
+	candidates := make(map[int][]string, len(pm.localEndpoints))
+	for siteID, eps := range pm.localEndpoints {
+		if len(eps) > 0 {
+			candidates[siteID] = eps
+		}
+	}
+	active := make(map[int]string, len(pm.localActiveEndpoint))
+	for siteID, ep := range pm.localActiveEndpoint {
+		active[siteID] = ep
+	}
+	timeout := pm.localTestTimeout
+	maxAttempts := pm.holepunchMaxAttempts
+	pm.mutex.Unlock()
+
+	anyChanged := false
+
+	for siteID, endpoints := range candidates {
+		if activeEndpoint := active[siteID]; activeEndpoint != "" {
+			// Already using a local endpoint - verify it's still working.
+			result := pm.holepunchTester.TestEndpoint(activeEndpoint, timeout)
+
+			pm.mutex.Lock()
+			if _, stillTracked := pm.localEndpoints[siteID]; !stillTracked {
+				pm.mutex.Unlock()
+				continue // peer was removed while we were testing
+			}
+			if result.Success {
+				pm.localFailures[siteID] = 0
+				pm.mutex.Unlock()
+				continue
+			}
+			pm.localFailures[siteID]++
+			failureCount := pm.localFailures[siteID]
+			pm.mutex.Unlock()
+
+			if failureCount >= maxAttempts {
+				logger.Warn("Local endpoint %s for site %d failed %d times, falling back to public/relay logic", activeEndpoint, siteID, failureCount)
+
+				pm.mutex.Lock()
+				pm.localActiveEndpoint[siteID] = ""
+				pm.localFailures[siteID] = 0
+				pm.holepunchFailures[siteID] = 0 // don't immediately re-trigger relay on stale failures
+				// The holepunch backoff timer keeps climbing while a local endpoint is
+				// active (checkHolepunchEndpoints skips those sites but backoff still
+				// applies), so reset it here to avoid the resumed public/relay logic
+				// being stuck polling at a stale, heavily-backed-off interval.
+				pm.holepunchCurrentInterval = pm.holepunchMinInterval
+				publicEndpoint := pm.holepunchEndpoints[siteID]
+				remainingLocal := remainingLocalCandidates(pm.localEndpoints[siteID], activeEndpoint)
+				pm.mutex.Unlock()
+
+				anyChanged = true
+				pm.deactivateLocalEndpoint(siteID)
+
+				// Don't wait out the next backed-off checkHolepunchEndpoints tick to find out
+				// whether the public endpoint is reachable - rapidly test it (and any untried
+				// local candidates) now so a total connectivity loss triggers relay within
+				// ~1-2 seconds instead of potentially tens of seconds.
+				go pm.rapidTestOnLocalFallback(siteID, publicEndpoint, remainingLocal)
+			}
+			continue
+		}
+
+		// Not currently using a local endpoint - probe candidates in order.
+		for _, endpoint := range endpoints {
+			result := pm.holepunchTester.TestEndpoint(endpoint, timeout)
+
+			pm.mutex.Lock()
+			if _, stillTracked := pm.localEndpoints[siteID]; !stillTracked {
+				pm.mutex.Unlock()
+				break // peer was removed while we were testing
+			}
+			if !result.Success {
+				pm.mutex.Unlock()
+				continue
+			}
+			pm.localActiveEndpoint[siteID] = endpoint
+			pm.localFailures[siteID] = 0
+			pm.mutex.Unlock()
+
+			logger.Info("Local endpoint %s for site %d is reachable (RTT: %v), switching to local connection", endpoint, siteID, result.RTT)
+			anyChanged = true
+			pm.activateLocalEndpoint(siteID, endpoint)
+			break
+		}
+	}
+
+	return anyChanged
+}
+
+// activateLocalEndpoint invokes the switch callback and notifies the server that a local
+// endpoint became active for the given site.
+func (pm *PeerMonitor) activateLocalEndpoint(siteID int, endpoint string) {
+	pm.mutex.Lock()
+	cb := pm.localSwitchCallback
+	pm.mutex.Unlock()
+
+	if cb != nil {
+		cb(siteID, endpoint)
+	}
+
+	pm.sendLocal(siteID, endpoint)
+}
+
+// deactivateLocalEndpoint invokes the fallback callback and notifies the server that the
+// given site fell back from its local endpoint.
+func (pm *PeerMonitor) deactivateLocalEndpoint(siteID int) {
+	pm.mutex.Lock()
+	cb := pm.localFallbackCallback
+	pm.mutex.Unlock()
+
+	if cb != nil {
+		cb(siteID)
+	}
+
+	pm.sendUnLocal(siteID)
+}
+
+// checkHolepunchEndpoints tests all holepunch endpoints
+// Returns true if any endpoint's status changed
+func (pm *PeerMonitor) checkHolepunchEndpoints() bool {
+	pm.mutex.Lock()
+	// Check if we're still running before doing any work
+	if !pm.running {
+		pm.mutex.Unlock()
+		return false
+	}
+	endpoints := make(map[int]string, len(pm.holepunchEndpoints))
+	for siteID, endpoint := range pm.holepunchEndpoints {
+		if pm.localActiveEndpoint[siteID] != "" {
+			continue // using a local connection, skip public/relay monitoring
+		}
+		endpoints[siteID] = endpoint
+	}
+	timeout := pm.holepunchTimeout
+	maxAttempts := pm.holepunchMaxAttempts
+	pm.mutex.Unlock()
+
+	anyStatusChanged := false
+
+	for siteID, endpoint := range endpoints {
+		// logger.Debug("holepunchTester: testing endpoint for site %d: %s", siteID, endpoint)
+		result := pm.holepunchTester.TestEndpoint(endpoint, timeout)
+
+		pm.mutex.Lock()
+		// Check if peer was removed while we were testing
+		if _, stillExists := pm.holepunchEndpoints[siteID]; !stillExists {
+			pm.mutex.Unlock()
+			continue // Peer was removed, skip processing
+		}
+
+		previousStatus, exists := pm.holepunchStatus[siteID]
+		pm.holepunchStatus[siteID] = result.Success
+		isRelayed := pm.relayedPeers[siteID]
+
+		// Track consecutive failures for relay triggering
+		if result.Success {
+			pm.holepunchFailures[siteID] = 0
+		} else {
+			pm.holepunchFailures[siteID]++
+		}
+		failureCount := pm.holepunchFailures[siteID]
+		pm.mutex.Unlock()
+
+		// Log status changes
+		statusChanged := !exists || previousStatus != result.Success
+		if statusChanged {
+			anyStatusChanged = true
+			if result.Success {
+				logger.Info("Holepunch to site %d (%s) is CONNECTED (RTT: %v)", siteID, endpoint, result.RTT)
+			} else {
+				if result.Error != nil {
+					logger.Warn("Holepunch to site %d (%s) is DISCONNECTED: %v", siteID, endpoint, result.Error)
+				} else {
+					logger.Warn("Holepunch to site %d (%s) is DISCONNECTED", siteID, endpoint)
+				}
+			}
+		}
+
+		// Update API with holepunch status
+		if pm.apiServer != nil {
+			// Update holepunch connection status
+			pm.apiServer.UpdatePeerHolepunchStatus(siteID, result.Success)
+
+			// Get the current WG connection status for this peer
+			pm.mutex.Lock()
+			wgConnected := pm.wgConnectionStatus[siteID]
+			pm.mutex.Unlock()
+
+			// Update API - use holepunch endpoint and relay status. Sites with an active
+			// local endpoint are filtered out of this loop above, so isLocal is always
+			// false here.
+			pm.apiServer.UpdatePeerStatus(siteID, wgConnected, result.RTT, endpoint, isRelayed, false)
+		}
+
+		// Handle relay logic based on holepunch status
+		// Check if we're still running before sending relay messages
+		pm.mutex.Lock()
+		stillRunning := pm.running
+		pm.mutex.Unlock()
+
+		if !stillRunning {
+			return anyStatusChanged // Stop processing if shutdown is in progress
+		}
+
+		if !result.Success && !isRelayed && failureCount >= maxAttempts {
+			// Holepunch failed and we're not relayed - trigger relay
+			logger.Info("Holepunch to site %d failed %d times, triggering relay", siteID, failureCount)
+			if pm.wsClient != nil {
+				pm.sendRelay(siteID)
+			}
+		} else if result.Success && isRelayed {
+			// Holepunch succeeded and we ARE relayed - switch back to direct
+			logger.Info("Holepunch to site %d succeeded while relayed, switching to direct connection", siteID)
+			if pm.wsClient != nil {
+				pm.sendUnRelay(siteID)
+			}
+		}
+	}
+
+	return anyStatusChanged
+}
+
+// GetHolepunchStatus returns the current holepunch status for all endpoints
+func (pm *PeerMonitor) GetHolepunchStatus() map[int]bool {
+	pm.mutex.Lock()
+	defer pm.mutex.Unlock()
+
+	status := make(map[int]bool, len(pm.holepunchStatus))
+	for siteID, connected := range pm.holepunchStatus {
+		status[siteID] = connected
+	}
+	return status
+}
+
+// Close stops monitoring and cleans up resources
+func (pm *PeerMonitor) Close() {
+	// Stop holepunch monitor first (outside of mutex to avoid deadlock)
+	pm.stopHolepunchMonitor()
+
+	// Stop exit node ICMP monitor, if running
+	pm.exitNodeMu.Lock()
+	if pm.exitNodeCancel != nil {
+		pm.exitNodeCancel()
+		pm.exitNodeCancel = nil
+	}
+	pm.exitNodeMu.Unlock()
+
+	// Stop all pending relay/unrelay batch senders
+	pm.relayBatch.cancelAll()
+	pm.relayBatch.close()
+	pm.unrelayBatch.cancelAll()
+	pm.unrelayBatch.close()
+
+	// Stop all pending local-connection batch senders
+	pm.localBatch.cancelAll()
+	pm.localBatch.close()
+	pm.unlocalBatch.cancelAll()
+	pm.unlocalBatch.close()
+
+	pm.mutex.Lock()
+	defer pm.mutex.Unlock()
+
+	logger.Debug("PeerMonitor: Starting cleanup")
+
+	// Stop and close all clients first
+	for siteID, client := range pm.monitors {
+		logger.Debug("PeerMonitor: Stopping client for site %d", siteID)
+		client.StopMonitor()
+		client.Close()
+		delete(pm.monitors, siteID)
+	}
+
+	pm.running = false
+
+	// Clean up netstack resources
+	logger.Debug("PeerMonitor: Cancelling netstack context")
+	if pm.nsCancel != nil {
+		pm.nsCancel() // Signal goroutines to stop
+	}
+
+	// Close the channel endpoint to unblock any pending reads
+	logger.Debug("PeerMonitor: Closing endpoint")
+	if pm.ep != nil {
+		pm.ep.Close()
+	}
+
+	// Wait for packet sender goroutine to finish with timeout
+	logger.Debug("PeerMonitor: Waiting for goroutines to finish")
+	done := make(chan struct{})
+	go func() {
+		pm.nsWg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		logger.Debug("PeerMonitor: Goroutines finished cleanly")
+	case <-time.After(2 * time.Second):
+		logger.Warn("PeerMonitor: Timeout waiting for goroutines to finish, proceeding anyway")
+	}
+
+	// Destroy the stack last, after all goroutines are done
+	logger.Debug("PeerMonitor: Destroying stack")
+	if pm.stack != nil {
+		pm.stack.Destroy()
+		pm.stack = nil
+	}
+
+	logger.Debug("PeerMonitor: Cleanup complete")
+}
+
+// // TestPeer tests connectivity to a specific peer
+// func (pm *PeerMonitor) TestPeer(siteID int) (bool, time.Duration, error) {
+// 	pm.mutex.Lock()
+// 	client, exists := pm.monitors[siteID]
+// 	pm.mutex.Unlock()
+
+// 	if !exists {
+// 		return false, 0, fmt.Errorf("peer with siteID %d not found", siteID)
+// 	}
+
+// 	ctx, cancel := context.WithTimeout(context.Background(), pm.timeout*time.Duration(pm.maxAttempts))
+// 	defer cancel()
+
+// 	connected, rtt := client.TestPeerConnection(ctx)
+// 	return connected, rtt, nil
+// }
+
+// // TestAllPeers tests connectivity to all peers
+// func (pm *PeerMonitor) TestAllPeers() map[int]struct {
+// 	Connected bool
+// 	RTT       time.Duration
+// } {
+// 	pm.mutex.Lock()
+// 	peers := make(map[int]*Client, len(pm.monitors))
+// 	for siteID, client := range pm.monitors {
+// 		peers[siteID] = client
+// 	}
+// 	pm.mutex.Unlock()
+
+// 	results := make(map[int]struct {
+// 		Connected bool
+// 		RTT       time.Duration
+// 	})
+// 	for siteID, client := range peers {
+// 		ctx, cancel := context.WithTimeout(context.Background(), pm.timeout*time.Duration(pm.maxAttempts))
+// 		connected, rtt := client.TestPeerConnection(ctx)
+// 		cancel()
+
+// 		results[siteID] = struct {
+// 			Connected bool
+// 			RTT       time.Duration
+// 		}{
+// 			Connected: connected,
+// 			RTT:       rtt,
+// 		}
+// 	}
+
+// 	return results
+// }
+
+// initNetstack initializes the gvisor netstack
+func (pm *PeerMonitor) initNetstack() error {
+	if pm.localIP == "" {
+		return fmt.Errorf("local IP not provided")
+	}
+
+	addr, err := netip.ParseAddr(pm.localIP)
+	if err != nil {
+		return fmt.Errorf("invalid local IP: %v", err)
+	}
+
+	// Create gvisor netstack
+	stackOpts := stack.Options{
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol, icmp.NewProtocol4, icmp.NewProtocol6},
+		HandleLocal:        true,
+	}
+
+	pm.ep = channel.New(256, 1420, "") // MTU 1420 (standard WG)
+	pm.stack = stack.New(stackOpts)
+
+	// Create NIC
+	if err := pm.stack.CreateNIC(1, pm.ep); err != nil {
+		return fmt.Errorf("failed to create NIC: %v", err)
+	}
+
+	// Add IP address
+	ipBytes := addr.As4()
+	protoAddr := tcpip.ProtocolAddress{
+		Protocol:          ipv4.ProtocolNumber,
+		AddressWithPrefix: tcpip.AddrFrom4(ipBytes).WithPrefix(),
+	}
+
+	if err := pm.stack.AddProtocolAddress(1, protoAddr, stack.AddressProperties{}); err != nil {
+		return fmt.Errorf("failed to add protocol address: %v", err)
+	}
+
+	// Add default route
+	pm.stack.AddRoute(tcpip.Route{
+		Destination: header.IPv4EmptySubnet,
+		NIC:         1,
+	})
+
+	// Register filter rule on MiddleDevice
+	// We want to intercept packets destined to our local IP
+	// But ONLY if they are for ports we are listening on
+	pm.middleDev.AddRule(addr, pm.handlePacket)
+
+	// Start packet sender (Stack -> WG)
+	pm.nsWg.Add(1)
+	go pm.runPacketSender()
+
+	return nil
+}
+
+// icmpv4EchoReplyIdent returns the ICMP identifier of packet if it is an IPv4
+// ICMP Echo Reply (type 0), so it can be matched against our own in-flight
+// exit-node ping probes before being pulled off the host's real traffic path.
+func icmpv4EchoReplyIdent(packet []byte) (uint16, bool) {
+	if len(packet) < 20 || packet[0]>>4 != 4 {
+		return 0, false
+	}
+	ihl := int(packet[0]&0x0f) * 4
+	if ihl < 20 || len(packet) < ihl+8 {
+		return 0, false
+	}
+	const icmpEchoReply = 0
+	if packet[ihl] != icmpEchoReply {
+		return 0, false
+	}
+	return binary.BigEndian.Uint16(packet[ihl+4 : ihl+6]), true
+}
+
+// handlePacket is called by MiddleDevice when a packet arrives for our IP
+func (pm *PeerMonitor) handlePacket(packet []byte) bool {
+	proto, ok := util.GetProtocol(packet)
+	if !ok {
+		return false
+	}
+
+	switch proto {
+	case 1: // ICMPv4 - only intercept Echo Replies matching one of our own active
+		// exit-node ping probes, identified by the ICMP identifier field. Anything
+		// else (including real ICMP traffic to/from the host, e.g. `ping`) must be
+		// left alone so it reaches the host TUN normally.
+		ident, ok := icmpv4EchoReplyIdent(packet)
+		if !ok {
+			return false
+		}
+
+		pm.portsLock.RLock()
+		active := pm.activeICMPIdents[ident]
+		pm.portsLock.RUnlock()
+
+		if !active {
+			return false
+		}
+	case 17: // UDP
+		// Check destination port
+		port, ok := util.GetDestPort(packet)
+		if !ok {
+			return false
+		}
+
+		// Check if we are listening on this port
+		pm.portsLock.RLock()
+		active := pm.activePorts[uint16(port)]
+		pm.portsLock.RUnlock()
+
+		if !active {
+			return false
+		}
+	default:
+		return false
+	}
+
+	// Inject into netstack
+	version := packet[0] >> 4
+	pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		Payload: buffer.MakeWithData(packet),
+	})
+
+	switch version {
+	case 4:
+		pm.ep.InjectInbound(ipv4.ProtocolNumber, pkb)
+	case 6:
+		pm.ep.InjectInbound(ipv6.ProtocolNumber, pkb)
+	default:
+		pkb.DecRef()
+		return false
+	}
+
+	pkb.DecRef()
+	return true // Handled
+}
+
+// runPacketSender reads packets from netstack and injects them into WireGuard
+func (pm *PeerMonitor) runPacketSender() {
+	defer pm.nsWg.Done()
+	logger.Debug("PeerMonitor: Packet sender goroutine started")
+
+	for {
+		// Use blocking ReadContext instead of polling - much more CPU efficient
+		// This will block until a packet is available or context is cancelled
+		pkt := pm.ep.ReadContext(pm.nsCtx)
+		if pkt == nil {
+			// Context was cancelled or endpoint closed
+			logger.Debug("PeerMonitor: Packet sender context cancelled, draining packets")
+			// Drain any remaining packets before exiting
+			for {
+				pkt := pm.ep.Read()
+				if pkt == nil {
+					break
+				}
+				pkt.DecRef()
+			}
+			logger.Debug("PeerMonitor: Packet sender goroutine exiting")
+			return
+		}
+
+		// Extract packet data
+		slices := pkt.AsSlices()
+		if len(slices) > 0 {
+			var totalSize int
+			for _, slice := range slices {
+				totalSize += len(slice)
+			}
+
+			buf := make([]byte, totalSize)
+			pos := 0
+			for _, slice := range slices {
+				copy(buf[pos:], slice)
+				pos += len(slice)
+			}
+
+			// Inject into MiddleDevice (outbound to WG)
+			pm.middleDev.InjectOutbound(buf)
+		}
+
+		pkt.DecRef()
+	}
+}
+
+// dial creates a UDP connection using the netstack
+func (pm *PeerMonitor) dial(network, addr string) (net.Conn, error) {
+	if pm.stack == nil {
+		return nil, fmt.Errorf("netstack not initialized")
+	}
+
+	// Parse remote address
+	raddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse local IP
+	localIP, err := netip.ParseAddr(pm.localIP)
+	if err != nil {
+		return nil, err
+	}
+	ipBytes := localIP.As4()
+
+	// Create UDP connection
+	// We bind to port 0 (ephemeral)
+	laddr := &tcpip.FullAddress{
+		NIC:  1,
+		Addr: tcpip.AddrFrom4(ipBytes),
+		Port: 0,
+	}
+
+	raddrTcpip := &tcpip.FullAddress{
+		NIC:  1,
+		Addr: tcpip.AddrFrom4([4]byte(raddr.IP.To4())),
+		Port: uint16(raddr.Port),
+	}
+
+	conn, err := gonet.DialUDP(pm.stack, laddr, raddrTcpip, ipv4.ProtocolNumber)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get local port
+	localAddr := conn.LocalAddr().(*net.UDPAddr)
+	port := uint16(localAddr.Port)
+
+	// Register port
+	pm.portsLock.Lock()
+	pm.activePorts[port] = true
+	pm.portsLock.Unlock()
+
+	// Wrap connection to cleanup port on close
+	return &trackedConn{
+		Conn: conn,
+		pm:   pm,
+		port: port,
+	}, nil
+}
+
+func (pm *PeerMonitor) removePort(port uint16) {
+	pm.portsLock.Lock()
+	delete(pm.activePorts, port)
+	pm.portsLock.Unlock()
+}
+
+type trackedConn struct {
+	net.Conn
+	pm   *PeerMonitor
+	port uint16
+}
+
+func (c *trackedConn) Close() error {
+	c.pm.removePort(c.port)
+	if c.Conn != nil {
+		return c.Conn.Close()
+	}
+	return nil
+}

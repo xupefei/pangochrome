@@ -1,0 +1,936 @@
+name: CI/CD Pipeline (AWS Self-Hosted Runners)
+
+# CI/CD workflow for building, publishing, attesting, signing container images and building release binaries.
+# Native multi-arch pipeline using two AWS EC2 self-hosted runners (x86_64 + arm64) to build and push architecture-specific images in parallel, then create multi-arch manifests.
+#
+# Required secrets:
+# - AWS_ACCOUNT_ID, AWS_ROLE_NAME, AWS_REGION
+# - EC2_INSTANCE_ID_AMD_RUNNER, EC2_INSTANCE_ID_ARM_RUNNER
+# - DOCKER_HUB_USERNAME / DOCKER_HUB_ACCESS_TOKEN
+# - GITHUB_TOKEN
+# - COSIGN_PRIVATE_KEY / COSIGN_PASSWORD / COSIGN_PUBLIC_KEY
+
+permissions:
+  contents: write          # gh-release
+  packages: write          # GHCR push
+  id-token: write          # Keyless-Signatures & Attestations (OIDC)
+  attestations: write      # actions/attest-build-provenance
+  security-events: write   # upload-sarif
+  actions: read
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+"
+
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (X.Y.Z or X.Y.Z-rc.N)"
+        required: true
+        type: string
+      publish_latest:
+        description: "Publish latest tag (non-RC only)"
+        required: true
+        type: boolean
+        default: false
+      publish_minor:
+        description: "Publish minor tag (X.Y) (non-RC only)"
+        required: true
+        type: boolean
+        default: false
+      target_branch:
+        description: "Branch to tag"
+        required: false
+        default: "main"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) Start AWS EC2 runner instances
+  # ---------------------------------------------------------------------------
+  pre-run:
+    name: Start AWS EC2 runners
+    runs-on: ubuntu-latest
+    permissions: write-all
+    outputs:
+      image_created: ${{ steps.created.outputs.image_created }}
+    steps:
+      - name: Capture created timestamp (shared)
+        id: created
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "image_created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ secrets.AWS_ROLE_NAME }}
+          role-duration-seconds: 3600
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Start EC2 instances
+        run: |
+          aws ec2 start-instances --instance-ids ${{ secrets.EC2_INSTANCE_ID_AMD_RUNNER }}
+          aws ec2 start-instances --instance-ids ${{ secrets.EC2_INSTANCE_ID_ARM_RUNNER }}
+          echo "EC2 instances started"
+
+  # ---------------------------------------------------------------------------
+  # 2) Prepare release
+  # ---------------------------------------------------------------------------
+  prepare:
+    if: github.event_name == 'workflow_dispatch'
+    name: Prepare release (create tag)
+    needs: [pre-run]
+    runs-on: [self-hosted, linux, x64]
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Validate version input
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$INPUT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "Invalid version: $INPUT_VERSION (expected X.Y.Z or X.Y.Z-rc.N)" >&2
+            exit 1
+          fi
+
+      - name: Create and push tag
+        shell: bash
+        env:
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          VERSION: ${{ inputs.version }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --prune origin
+          git checkout "$TARGET_BRANCH"
+          git pull --ff-only origin "$TARGET_BRANCH"
+          if git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null; then
+            echo "Tag $VERSION already exists" >&2
+            exit 1
+          fi
+          git tag -a "$VERSION" -m "Release $VERSION"
+          git push origin "refs/tags/$VERSION"
+
+  # ---------------------------------------------------------------------------
+  # 3) Build and Release (x86 job)
+  # ---------------------------------------------------------------------------
+  build-amd:
+    name: Build image (linux/amd64)
+    needs: [pre-run, prepare]
+    if: ${{ needs.pre-run.result == 'success' && ((github.event_name == 'push' && github.actor != 'github-actions[bot]' && needs.prepare.result == 'skipped') || (github.event_name == 'workflow_dispatch' && (needs.prepare.result == 'success' || needs.prepare.result == 'skipped'))) }}
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 120
+    env:
+      DOCKERHUB_IMAGE: docker.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
+      GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
+      IMAGE_LICENSE: ${{ github.event.repository.license.spdx_id || 'NOASSERTION' }}
+      IMAGE_CREATED: ${{ needs.pre-run.outputs.image_created }}
+
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      is_rc: ${{ steps.tag.outputs.is_rc }}
+      major: ${{ steps.tag.outputs.major }}
+      minor: ${{ steps.tag.outputs.minor }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Monitor storage space
+        shell: bash
+        run: |
+          THRESHOLD=75
+          USED_SPACE=$(df / | grep / | awk '{ print $5 }' | sed 's/%//g')
+          echo "Used space: $USED_SPACE%"
+          if [ "$USED_SPACE" -ge "$THRESHOLD" ]; then
+            echo "Disk usage >= ${THRESHOLD}%, pruning docker..."
+            echo y | docker system prune -a || true
+          else
+            echo "Disk usage < ${THRESHOLD}%, no action needed."
+          fi
+
+      - name: Determine tag + rc/major/minor
+        id: tag
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$INPUT_VERSION"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+
+          if ! [[ "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "Invalid tag: $TAG" >&2
+            exit 1
+          fi
+
+          IS_RC="false"
+          if [[ "$TAG" =~ -rc\.[0-9]+$ ]]; then
+            IS_RC="true"
+          fi
+
+          MAJOR="$(echo "$TAG" | cut -d. -f1)"
+          MINOR="$(echo "$TAG" | cut -d. -f1,2)"
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "is_rc=$IS_RC" >> "$GITHUB_OUTPUT"
+          echo "major=$MAJOR" >> "$GITHUB_OUTPUT"
+          echo "minor=$MINOR" >> "$GITHUB_OUTPUT"
+
+          echo "TAG=$TAG" >> $GITHUB_ENV
+          echo "IS_RC=$IS_RC" >> $GITHUB_ENV
+          echo "MAJOR_TAG=$MAJOR" >> $GITHUB_ENV
+          echo "MINOR_TAG=$MINOR" >> $GITHUB_ENV
+
+      - name: Wait for tag to be visible (dispatch only)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in {1..90}; do
+            if git ls-remote --tags origin "refs/tags/${TAG}" | grep -qE "refs/tags/${TAG}$"; then
+              echo "Tag ${TAG} is visible on origin"; exit 0
+            fi
+            echo "Tag not yet visible, retrying... ($i/90)"
+            sleep 2
+          done
+          echo "Tag ${TAG} not visible after waiting" >&2
+          exit 1
+
+      - name: Ensure repository is at the tagged commit (dispatch only)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          git checkout "refs/tags/${TAG}"
+          echo "Checked out $(git rev-parse --short HEAD) for tag ${TAG}"
+
+      #- name: Set up QEMU
+      #  uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+
+      #- name: Set up Docker Buildx
+      #  uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Normalize image names to lowercase
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "GHCR_IMAGE=${GHCR_IMAGE,,}" >> "$GITHUB_ENV"
+          echo "DOCKERHUB_IMAGE=${DOCKERHUB_IMAGE,,}" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # Build ONLY amd64 and push arch-specific tag suffixes used later for manifest creation.
+      - name: Build and push (amd64 -> *:amd64-TAG)
+        id: build_amd
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          build-args: VERSION=${{ env.TAG }}
+          tags: |
+            ${{ env.GHCR_IMAGE }}:amd64-${{ env.TAG }}
+            ${{ env.DOCKERHUB_IMAGE }}:amd64-${{ env.TAG }}
+          labels: |
+            org.opencontainers.image.title=${{ github.event.repository.name }}
+            org.opencontainers.image.version=${{ env.TAG }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.event.repository.html_url }}
+            org.opencontainers.image.url=${{ github.event.repository.html_url }}
+            org.opencontainers.image.documentation=${{ github.event.repository.html_url }}
+            org.opencontainers.image.description=${{ github.event.repository.description }}
+            org.opencontainers.image.licenses=${{ env.IMAGE_LICENSE }}
+            org.opencontainers.image.created=${{ env.IMAGE_CREATED }}
+            org.opencontainers.image.ref.name=${{ env.TAG }}
+            org.opencontainers.image.authors=${{ github.repository_owner }}
+          cache-from: type=gha,scope=${{ github.repository }}-amd64
+          cache-to: type=gha,mode=max,scope=${{ github.repository }}-amd64
+
+  # ---------------------------------------------------------------------------
+  # 4) Build ARM64 image natively on ARM runner
+  # ---------------------------------------------------------------------------
+  build-arm:
+    name: Build image (linux/arm64)
+    needs: [pre-run, prepare]
+    if: ${{ needs.pre-run.result == 'success' && ((github.event_name == 'push' && github.actor != 'github-actions[bot]' && needs.prepare.result == 'skipped') || (github.event_name == 'workflow_dispatch' && (needs.prepare.result == 'success' || needs.prepare.result == 'skipped'))) }}
+    runs-on: [self-hosted, linux, arm64] # NOTE: ensure label exists on runner
+    timeout-minutes: 120
+    env:
+      DOCKERHUB_IMAGE: docker.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
+      GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
+      IMAGE_LICENSE: ${{ github.event.repository.license.spdx_id || 'NOASSERTION' }}
+      IMAGE_CREATED: ${{ needs.pre-run.outputs.image_created }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Monitor storage space
+        shell: bash
+        run: |
+          THRESHOLD=75
+          USED_SPACE=$(df / | grep / | awk '{ print $5 }' | sed 's/%//g')
+          echo "Used space: $USED_SPACE%"
+          if [ "$USED_SPACE" -ge "$THRESHOLD" ]; then
+            echo y | docker system prune -a || true
+          fi
+
+      - name: Determine tag + validate format
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$INPUT_VERSION"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+
+          if ! [[ "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "Invalid tag: $TAG" >&2
+            exit 1
+          fi
+
+          echo "TAG=$TAG" >> $GITHUB_ENV
+
+      - name: Wait for tag to be visible (dispatch only)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in {1..90}; do
+            if git ls-remote --tags origin "refs/tags/${TAG}" | grep -qE "refs/tags/${TAG}$"; then
+              echo "Tag ${TAG} is visible on origin"; exit 0
+            fi
+            echo "Tag not yet visible, retrying... ($i/90)"
+            sleep 2
+          done
+          echo "Tag ${TAG} not visible after waiting" >&2
+          exit 1
+
+      - name: Ensure repository is at the tagged commit (dispatch only)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          git checkout "refs/tags/${TAG}"
+          echo "Checked out $(git rev-parse --short HEAD) for tag ${TAG}"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Normalize image names to lowercase
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "GHCR_IMAGE=${GHCR_IMAGE,,}" >> "$GITHUB_ENV"
+          echo "DOCKERHUB_IMAGE=${DOCKERHUB_IMAGE,,}" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # Build ONLY arm64 and push arch-specific tag suffixes used later for manifest creation.
+      - name: Build and push (arm64 -> *:arm64-TAG)
+        id: build_arm
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: true
+          platforms: linux/arm64
+          build-args: VERSION=${{ env.TAG }}
+          tags: |
+            ${{ env.GHCR_IMAGE }}:arm64-${{ env.TAG }}
+            ${{ env.DOCKERHUB_IMAGE }}:arm64-${{ env.TAG }}
+          labels: |
+            org.opencontainers.image.title=${{ github.event.repository.name }}
+            org.opencontainers.image.version=${{ env.TAG }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.event.repository.html_url }}
+            org.opencontainers.image.url=${{ github.event.repository.html_url }}
+            org.opencontainers.image.documentation=${{ github.event.repository.html_url }}
+            org.opencontainers.image.description=${{ github.event.repository.description }}
+            org.opencontainers.image.licenses=${{ env.IMAGE_LICENSE }}
+            org.opencontainers.image.created=${{ env.IMAGE_CREATED }}
+            org.opencontainers.image.ref.name=${{ env.TAG }}
+            org.opencontainers.image.authors=${{ github.repository_owner }}
+          cache-from: type=gha,scope=${{ github.repository }}-arm64
+          cache-to: type=gha,mode=max,scope=${{ github.repository }}-arm64
+
+  # ---------------------------------------------------------------------------
+  # 4b) Build ARMv7 image (linux/arm/v7) on arm runner via QEMU
+  # ---------------------------------------------------------------------------
+  build-armv7:
+    name: Build image (linux/arm/v7)
+    needs: [pre-run, prepare]
+    if: ${{ needs.pre-run.result == 'success' && ((github.event_name == 'push' && github.actor != 'github-actions[bot]' && needs.prepare.result == 'skipped') || (github.event_name == 'workflow_dispatch' && (needs.prepare.result == 'success' || needs.prepare.result == 'skipped'))) }}
+    runs-on: [self-hosted, linux, arm64]
+    timeout-minutes: 120
+    env:
+      DOCKERHUB_IMAGE: docker.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
+      GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
+      IMAGE_LICENSE: ${{ github.event.repository.license.spdx_id || 'NOASSERTION' }}
+      IMAGE_CREATED: ${{ needs.pre-run.outputs.image_created }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Determine tag + validate format
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$INPUT_VERSION"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+
+          if ! [[ "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "Invalid tag: $TAG" >&2
+            exit 1
+          fi
+
+          echo "TAG=$TAG" >> $GITHUB_ENV
+
+      - name: Wait for tag to be visible (dispatch only)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in {1..90}; do
+            if git ls-remote --tags origin "refs/tags/${TAG}" | grep -qE "refs/tags/${TAG}$"; then
+              echo "Tag ${TAG} is visible on origin"; exit 0
+            fi
+            echo "Tag not yet visible, retrying... ($i/90)"
+            sleep 2
+          done
+          echo "Tag ${TAG} not visible after waiting" >&2
+          exit 1
+
+      - name: Ensure repository is at the tagged commit (dispatch only)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          git checkout "refs/tags/${TAG}"
+          echo "Checked out $(git rev-parse --short HEAD) for tag ${TAG}"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Normalize image names to lowercase
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "GHCR_IMAGE=${GHCR_IMAGE,,}" >> "$GITHUB_ENV"
+          echo "DOCKERHUB_IMAGE=${DOCKERHUB_IMAGE,,}" >> "$GITHUB_ENV"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build and push (arm/v7 -> *:armv7-TAG)
+        id: build_armv7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: true
+          platforms: linux/arm/v7
+          build-args: VERSION=${{ env.TAG }}
+          tags: |
+            ${{ env.GHCR_IMAGE }}:armv7-${{ env.TAG }}
+            ${{ env.DOCKERHUB_IMAGE }}:armv7-${{ env.TAG }}
+          labels: |
+            org.opencontainers.image.title=${{ github.event.repository.name }}
+            org.opencontainers.image.version=${{ env.TAG }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.event.repository.html_url }}
+            org.opencontainers.image.url=${{ github.event.repository.html_url }}
+            org.opencontainers.image.documentation=${{ github.event.repository.html_url }}
+            org.opencontainers.image.description=${{ github.event.repository.description }}
+            org.opencontainers.image.licenses=${{ env.IMAGE_LICENSE }}
+            org.opencontainers.image.created=${{ env.IMAGE_CREATED }}
+            org.opencontainers.image.ref.name=${{ env.TAG }}
+            org.opencontainers.image.authors=${{ github.repository_owner }}
+          cache-from: type=gha,scope=${{ github.repository }}-armv7
+          cache-to: type=gha,mode=max,scope=${{ github.repository }}-armv7
+
+  # ---------------------------------------------------------------------------
+  # 5) Create and push multi-arch manifests (TAG, plus optional latest/major/minor)
+  # ---------------------------------------------------------------------------
+  create-manifest:
+    name: Create multi-arch manifests
+    needs: [build-amd, build-arm, build-armv7]
+    if: ${{ needs.build-amd.result == 'success' && needs.build-arm.result == 'success' && needs.build-armv7.result == 'success' }}
+    runs-on: [self-hosted, linux, x64] # NOTE: ensure label exists on runner
+    timeout-minutes: 30
+    env:
+      DOCKERHUB_IMAGE: docker.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
+      GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
+      TAG: ${{ needs.build-amd.outputs.tag }}
+      IS_RC: ${{ needs.build-amd.outputs.is_rc }}
+      MAJOR_TAG: ${{ needs.build-amd.outputs.major }}
+      MINOR_TAG: ${{ needs.build-amd.outputs.minor }}
+      # workflow_dispatch controls are respected only here (tagging policy)
+      #PUBLISH_LATEST: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_latest || vars.PUBLISH_LATEST }}
+      #PUBLISH_MINOR:  ${{ github.event_name == 'workflow_dispatch' && inputs.publish_minor  || vars.PUBLISH_MINOR  }}
+    steps:
+      - name: Log in to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Normalize image names to lowercase
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "GHCR_IMAGE=${GHCR_IMAGE,,}" >> "$GITHUB_ENV"
+          echo "DOCKERHUB_IMAGE=${DOCKERHUB_IMAGE,,}" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx (needed for imagetools)
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Create & push multi-arch index (GHCR :TAG) via imagetools
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            -t "${GHCR_IMAGE}:${TAG}" \
+            "${GHCR_IMAGE}:amd64-${TAG}" \
+            "${GHCR_IMAGE}:arm64-${TAG}" \
+            "${GHCR_IMAGE}:armv7-${TAG}"
+
+      - name: Create & push multi-arch index (Docker Hub :TAG) via imagetools
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            -t "${DOCKERHUB_IMAGE}:${TAG}" \
+            "${DOCKERHUB_IMAGE}:amd64-${TAG}" \
+            "${DOCKERHUB_IMAGE}:arm64-${TAG}" \
+            "${DOCKERHUB_IMAGE}:armv7-${TAG}"
+
+      # Additional tags for non-RC releases: latest, major, minor (always)
+      - name: Publish additional tags (non-RC only) via imagetools
+        if: ${{ env.IS_RC != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tags_to_publish=("${MAJOR_TAG}" "${MINOR_TAG}" "latest")
+
+          for t in "${tags_to_publish[@]}"; do
+            echo "Publishing GHCR tag ${t} -> ${TAG}"
+            docker buildx imagetools create \
+              -t "${GHCR_IMAGE}:${t}" \
+              "${GHCR_IMAGE}:amd64-${TAG}" \
+              "${GHCR_IMAGE}:arm64-${TAG}" \
+              "${GHCR_IMAGE}:armv7-${TAG}"
+
+            echo "Publishing Docker Hub tag ${t} -> ${TAG}"
+            docker buildx imagetools create \
+              -t "${DOCKERHUB_IMAGE}:${t}" \
+              "${DOCKERHUB_IMAGE}:amd64-${TAG}" \
+              "${DOCKERHUB_IMAGE}:arm64-${TAG}" \
+              "${DOCKERHUB_IMAGE}:armv7-${TAG}"
+          done
+
+  # ---------------------------------------------------------------------------
+  # 6) Sign/attest + build binaries + draft release (x86 runner)
+  # ---------------------------------------------------------------------------
+  sign-and-release:
+    name: Sign, attest, and release
+    needs: [create-manifest, build-amd]
+    if: ${{ needs.create-manifest.result == 'success' && needs.build-amd.result == 'success' }}
+    runs-on: [self-hosted, linux, x64] # NOTE: ensure label exists on runner
+    timeout-minutes: 120
+    env:
+      DOCKERHUB_IMAGE: docker.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
+      GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
+      TAG: ${{ needs.build-amd.outputs.tag }}
+      IS_RC: ${{ needs.build-amd.outputs.is_rc }}
+      IMAGE_LICENSE: ${{ github.event.repository.license.spdx_id || 'NOASSERTION' }}
+      IMAGE_CREATED: ${{ needs.pre-run.outputs.image_created }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Ensure repository is at the tagged commit (dispatch only)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          git checkout "refs/tags/${TAG}"
+          echo "Checked out $(git rev-parse --short HEAD) for tag ${TAG}"
+
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Normalize image names to lowercase
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "GHCR_IMAGE=${GHCR_IMAGE,,}" >> "$GITHUB_ENV"
+          echo "DOCKERHUB_IMAGE=${DOCKERHUB_IMAGE,,}" >> "$GITHUB_ENV"
+
+      - name: Ensure jq is installed
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v jq >/dev/null 2>&1; then
+            exit 0
+          fi
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+      - name: Set up Docker Buildx (needed for imagetools)
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Resolve multi-arch digest refs (by TAG)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          get_digest() {
+            local ref="$1"
+            local d=""
+            # Primary: buildx format output
+            d="$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}' 2>/dev/null || true)"
+
+            # Fallback: parse from plain text if format fails
+            if ! [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              d="$(docker buildx imagetools inspect "$ref" 2>/dev/null | awk '/^Digest:/ {print $2; exit}' || true)"
+            fi
+
+            if ! [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "ERROR: Could not extract digest for $ref" >&2
+              docker buildx imagetools inspect "$ref" || true
+              exit 1
+            fi
+
+            echo "$d"
+          }
+
+          GHCR_DIGEST="$(get_digest "${GHCR_IMAGE}:${TAG}")"
+          echo "GHCR_REF=${GHCR_IMAGE}@${GHCR_DIGEST}" >> "$GITHUB_ENV"
+          echo "GHCR_DIGEST=${GHCR_DIGEST}" >> "$GITHUB_ENV"
+          echo "Resolved GHCR_REF=${GHCR_IMAGE}@${GHCR_DIGEST}"
+
+          if [ -n "${{ secrets.DOCKER_HUB_USERNAME }}" ] && [ -n "${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}" ]; then
+            DH_DIGEST="$(get_digest "${DOCKERHUB_IMAGE}:${TAG}")"
+            echo "DH_REF=${DOCKERHUB_IMAGE}@${DH_DIGEST}" >> "$GITHUB_ENV"
+            echo "DH_DIGEST=${DH_DIGEST}" >> "$GITHUB_ENV"
+            echo "Resolved DH_REF=${DOCKERHUB_IMAGE}@${DH_DIGEST}"
+          fi
+
+      - name: Attest build provenance (GHCR) (digest)
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-name: ${{ env.GHCR_IMAGE }}
+          subject-digest: ${{ env.GHCR_DIGEST }}
+          push-to-registry: true
+          show-summary: true
+
+      - name: Attest build provenance (Docker Hub)
+        continue-on-error: true
+        if: ${{ env.DH_DIGEST != '' }}
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-name: index.docker.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
+          subject-digest: ${{ env.DH_DIGEST }}
+          push-to-registry: true
+          show-summary: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
+        with:
+          cosign-release: "v3.0.2"
+
+      - name: Sanity check cosign private key
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD:    ${{ secrets.COSIGN_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cosign public-key --key env://COSIGN_PRIVATE_KEY >/dev/null
+
+      - name: Generate SBOM (SPDX JSON) from GHCR digest
+        uses: aquasecurity/trivy-action@c03d123cb480c08c69b054af418ea5e69fe6e57e # v0.34.2
+        with:
+          image-ref: ${{ env.GHCR_REF }}
+          format: spdx-json
+          output: sbom.spdx.json
+          version: v0.69.3
+
+      - name: Validate + minify SBOM JSON
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -e . sbom.spdx.json >/dev/null
+          jq -c . sbom.spdx.json > sbom.min.json && mv sbom.min.json sbom.spdx.json
+
+      - name: Sign GHCR digest (key, recursive)
+        env:
+          COSIGN_YES: "true"
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD:    ${{ secrets.COSIGN_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cosign sign --key env://COSIGN_PRIVATE_KEY --recursive "${GHCR_REF}"
+          sleep 20
+
+      - name: Create SBOM attestation (GHCR, key)
+        env:
+          COSIGN_YES: "true"
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD:    ${{ secrets.COSIGN_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cosign attest \
+            --key env://COSIGN_PRIVATE_KEY \
+            --type spdxjson \
+            --predicate sbom.spdx.json \
+            "${GHCR_REF}"
+
+      - name: Create SBOM attestation (Docker Hub, key)
+        continue-on-error: true
+        env:
+          COSIGN_YES: "true"
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD:    ${{ secrets.COSIGN_PASSWORD }}
+          COSIGN_DOCKER_MEDIA_TYPES: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cosign attest \
+            --key env://COSIGN_PRIVATE_KEY \
+            --type spdxjson \
+            --predicate sbom.spdx.json \
+            "${DH_REF}"
+
+      - name: Keyless sign & verify GHCR digest (OIDC)
+        env:
+          COSIGN_YES: "true"
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          ISSUER: https://token.actions.githubusercontent.com
+        shell: bash
+        run: |
+          set -euo pipefail
+          cosign sign --rekor-url https://rekor.sigstore.dev --recursive "${GHCR_REF}"
+          cosign verify \
+            --certificate-oidc-issuer "${ISSUER}" \
+            --certificate-identity "https://github.com/${WORKFLOW_REF}" \
+            "${GHCR_REF}" -o text
+
+      - name: Verify signature (public key) GHCR digest + tag
+        env:
+          COSIGN_PUBLIC_KEY: ${{ secrets.COSIGN_PUBLIC_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cosign verify --key env://COSIGN_PUBLIC_KEY "${GHCR_REF}" -o text
+          cosign verify --key env://COSIGN_PUBLIC_KEY "${GHCR_IMAGE}:${TAG}" -o text
+
+      - name: Verify SBOM attestation (GHCR)
+        env:
+          COSIGN_PUBLIC_KEY: ${{ secrets.COSIGN_PUBLIC_KEY }}
+        run: cosign verify-attestation --key env://COSIGN_PUBLIC_KEY --type spdxjson "${GHCR_REF}" -o text
+        shell: bash
+
+      - name: Sign Docker Hub digest (key, recursive)
+        continue-on-error: true
+        env:
+          COSIGN_YES: "true"
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD:    ${{ secrets.COSIGN_PASSWORD }}
+          COSIGN_DOCKER_MEDIA_TYPES: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cosign sign --key env://COSIGN_PRIVATE_KEY --recursive "${DH_REF}"
+
+      - name: Keyless sign & verify Docker Hub digest (OIDC)
+        continue-on-error: true
+        if: ${{ env.DH_REF != '' }}
+        env:
+          COSIGN_YES: "true"
+          ISSUER: https://token.actions.githubusercontent.com
+          COSIGN_DOCKER_MEDIA_TYPES: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cosign sign --rekor-url https://rekor.sigstore.dev --recursive "${DH_REF}"
+          cosign verify \
+            --certificate-oidc-issuer "${ISSUER}" \
+            --certificate-identity "https://github.com/${{ github.workflow_ref }}" \
+            "${DH_REF}" -o text
+
+      - name: Verify signature (public key) Docker Hub digest + tag
+        continue-on-error: true
+        if: ${{ env.DH_REF != '' }}
+        env:
+          COSIGN_PUBLIC_KEY: ${{ secrets.COSIGN_PUBLIC_KEY }}
+          COSIGN_DOCKER_MEDIA_TYPES: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cosign verify --key env://COSIGN_PUBLIC_KEY "${DH_REF}" -o text
+          cosign verify --key env://COSIGN_PUBLIC_KEY "${DOCKERHUB_IMAGE}:${TAG}" -o text
+
+      - name: Build binaries
+        env:
+          CGO_ENABLED: "0"
+          GOFLAGS: "-trimpath"
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -j 10 go-build-release VERSION="${TAG}"
+
+      - name: Create GitHub Release (draft)
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ env.TAG }}
+          generate_release_notes: true
+          prerelease: ${{ env.IS_RC == 'true' }}
+          files: |
+            bin/*
+          fail_on_unmatched_files: true
+          draft: true
+          body: |
+            ## Container Images
+            - GHCR: `${{ env.GHCR_REF }}`
+            - Docker Hub: `${{ env.DH_REF || 'N/A' }}`
+            **Tag:** `${{ env.TAG }}`
+
+  # ---------------------------------------------------------------------------
+  # 7) Stop AWS EC2 runner instances
+  # ---------------------------------------------------------------------------
+
+  post-run:
+    name: Stop AWS EC2 runners
+    needs: [pre-run, prepare, build-amd, build-arm, build-armv7, create-manifest, sign-and-release]
+    if: ${{ always() && needs.pre-run.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions: write-all
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ secrets.AWS_ROLE_NAME }}
+          role-duration-seconds: 3600
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Stop EC2 instances
+        run: |
+          aws ec2 stop-instances --instance-ids ${{ secrets.EC2_INSTANCE_ID_AMD_RUNNER }}
+          aws ec2 stop-instances --instance-ids ${{ secrets.EC2_INSTANCE_ID_ARM_RUNNER }}
+          echo "EC2 instances stopped"
