@@ -41,99 +41,151 @@ type tunnelEvents struct {
 	authError func(message string) // the server rejected the session
 }
 
-// tunnel runs one netstack olm. olm keeps process-wide state, so a process
-// has at most one tunnel.
+// tunnel runs at most one netstack olm at a time. Each connection gets its
+// own olm instance and context, so that stop can end StartTunnel even if
+// it is still setting up.
 type tunnel struct {
-	o      *olm.Olm
-	events tunnelEvents
+	version string
+	events  tunnelEvents
 
-	mu      sync.Mutex
-	running bool
+	mu  sync.Mutex
+	run *tunnelRun
 }
 
-func newTunnel(version string, events tunnelEvents) (*tunnel, error) {
-	t := &tunnel{events: events}
-	o, err := olm.Init(context.Background(), olm.OlmConfig{
+type tunnelRun struct {
+	o      *olm.Olm
+	cancel context.CancelFunc
+	done   chan struct{} // closed when StartTunnel returns
+}
+
+func newTunnel(version string, events tunnelEvents) *tunnel {
+	return &tunnel{version: version, events: events}
+}
+
+func (t *tunnel) start(cfg tunnelConfig) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.run != nil {
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	run := &tunnelRun{cancel: cancel, done: make(chan struct{})}
+	o, err := olm.Init(ctx, olm.OlmConfig{
 		LogLevel:    "INFO",
 		Agent:       "Pangochrome",
-		Version:     version,
+		Version:     t.version,
 		Netstack:    true,
 		NetstackDNS: exitNodeDNS,
 		OnConnected: func() {
-			events.connected()
-			events.changed()
+			t.events.connected()
+			t.events.changed()
 		},
-		OnTerminated: func() { t.stopFromOlm("the server ended the connection") },
+		OnTerminated: func() { t.endedByOlm(run, "The server ended the connection.") },
 		OnAuthError: func(status int, message string) {
-			go t.stop()
-			events.authError(message)
+			go t.stopRun(run)
+			t.events.authError(message)
 		},
-		OnOlmError: func(code, message string) { events.changed() },
+		OnOlmError: func(code, message string) { t.events.changed() },
 	})
 	if err != nil {
-		return nil, err
+		cancel()
+		return err
 	}
-	t.o = o
-	return t, nil
+	run.o = o
+	t.run = run
+	go func() {
+		o.StartTunnel(olm.TunnelConfig{
+			Endpoint:  cfg.Server,
+			ID:        cfg.OlmID,
+			Secret:    cfg.OlmSecret,
+			UserToken: cfg.UserToken,
+			OrgID:     cfg.OrgID,
+			MTU:       1280,
+			Holepunch: true,
+			// Never touch the host resolver: the browser reaches aliases
+			// through the proxy, not through system DNS.
+			NativeDNSManaged:   true,
+			InitialFingerprint: fingerprint(),
+		})
+		close(run.done)
+		// StartTunnel returns early only when setup fails.
+		if ctx.Err() == nil {
+			t.endedByOlm(run, "The tunnel could not start. See helper.log for details.")
+		}
+	}()
+	return nil
 }
 
-func (t *tunnel) start(cfg tunnelConfig) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.running {
-		return
-	}
-	t.running = true
-	go t.o.StartTunnel(olm.TunnelConfig{
-		Endpoint:  cfg.Server,
-		ID:        cfg.OlmID,
-		Secret:    cfg.OlmSecret,
-		UserToken: cfg.UserToken,
-		OrgID:     cfg.OrgID,
-		MTU:       1280,
-		Holepunch: true,
-		// Never touch the host resolver: the browser reaches aliases
-		// through the proxy, not through system DNS.
-		NativeDNSManaged:   true,
-		InitialFingerprint: fingerprint(),
-	})
-}
-
-// stop blocks until olm has torn the tunnel down.
+// stop blocks until the current tunnel is torn down.
 func (t *tunnel) stop() {
 	t.mu.Lock()
-	wasRunning := t.running
-	t.running = false
+	run := t.run
 	t.mu.Unlock()
-	if wasRunning {
-		_ = t.o.StopTunnel()
-		t.events.changed()
+	if run != nil {
+		t.stopRun(run)
 	}
 }
 
-// stopFromOlm handles olm ending the tunnel itself, for example after the
+// stopRun tears down run if it is still the current tunnel. Cancelling the
+// context ends StartTunnel first, so StopTunnel never overlaps its setup.
+func (t *tunnel) stopRun(run *tunnelRun) {
+	t.mu.Lock()
+	if t.run != run {
+		t.mu.Unlock()
+		return
+	}
+	t.run = nil
+	t.mu.Unlock()
+
+	run.cancel()
+	<-run.done
+	_ = run.o.StopTunnel()
+	t.events.changed()
+}
+
+// endedByOlm handles olm ending the tunnel itself, for example after the
 // server sends a terminate message.
-func (t *tunnel) stopFromOlm(fallback string) {
+func (t *tunnel) endedByOlm(run *tunnelRun, fallback string) {
+	t.mu.Lock()
+	current := t.run == run
+	t.mu.Unlock()
+	if !current {
+		return
+	}
 	reason := fallback
-	if st := t.o.GetStatus(); st.OlmError != nil && st.OlmError.Message != "" {
+	if st := run.o.GetStatus(); st.OlmError != nil && st.OlmError.Message != "" {
 		reason = st.OlmError.Message
 	}
-	go t.stop()
+	go t.stopRun(run)
 	t.events.stopped(reason)
 }
 
-func (t *tunnel) isRunning() bool {
+// current returns the olm of the running tunnel, or nil.
+func (t *tunnel) current() *olm.Olm {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.running
+	if t.run == nil {
+		return nil
+	}
+	return t.run.o
 }
 
+func (t *tunnel) isRunning() bool { return t.current() != nil }
+
 func (t *tunnel) selectExitNode(siteResourceID int, siteIDs []int) error {
-	return t.o.SelectGateway(siteResourceID, siteIDs)
+	o := t.current()
+	if o == nil {
+		return errTunnelDown
+	}
+	return o.SelectGateway(siteResourceID, siteIDs)
 }
 
 func (t *tunnel) clearExitNode() error {
-	return t.o.DisableGateway()
+	o := t.current()
+	if o == nil {
+		return nil
+	}
+	return o.DisableGateway()
 }
 
 // tunnelStatus is what the extension sees of the tunnel.
@@ -148,10 +200,11 @@ type tunnelStatus struct {
 }
 
 func (t *tunnel) status() tunnelStatus {
-	if !t.isRunning() {
+	o := t.current()
+	if o == nil {
 		return tunnelStatus{routes: routes{Hosts: []string{}, CIDRs: []string{}}}
 	}
-	st := t.o.GetStatus()
+	st := o.GetStatus()
 	s := tunnelStatus{
 		running:       true,
 		registered:    st.Registered,
@@ -161,8 +214,8 @@ func (t *tunnel) status() tunnelStatus {
 	if st.OlmError != nil {
 		s.olmError = st.OlmError.Message
 	}
-	connected := t.o.Sites()
-	aliasNames := t.o.AliasNames()
+	connected := o.Sites()
+	aliasNames := o.AliasNames()
 	s.sites = buildSites(connected, st.PeerStatuses, aliasNames)
 	s.routes = buildRoutes(connected, aliasNames)
 	return s
@@ -267,16 +320,22 @@ func sitePrefixes(connected []peers.SiteConfig) []netip.Prefix {
 // subnets and, with an exit node active, the internet, all through the
 // tunnel.
 func (t *tunnel) dial(ctx context.Context, host, port string) (net.Conn, error) {
-	tnet := t.o.Net()
-	if tnet == nil || !t.isRunning() {
+	o := t.current()
+	if o == nil {
+		return nil, errTunnelDown
+	}
+	tnet := o.Net()
+	if tnet == nil {
 		return nil, errTunnelDown
 	}
 	portNum, err := strconv.ParseUint(port, 10, 16)
 	if err != nil || portNum == 0 {
 		return nil, fmt.Errorf("invalid port %q", port)
 	}
-	gatewayActive := t.o.GetStatus().GatewayActive
-	addrs, err := t.resolve(ctx, normaliseName(strings.Trim(host, "[]")), gatewayActive, sitePrefixes(t.o.Sites()))
+	host = normaliseName(strings.Trim(host, "[]"))
+	addrs, err := resolveDestination(host, o.GetStatus().GatewayActive, sitePrefixes(o.Sites()),
+		o.ResolveAlias,
+		func(name string) ([]string, error) { return tnet.LookupContextHost(ctx, name) })
 	if err != nil {
 		return nil, err
 	}
@@ -289,18 +348,6 @@ func (t *tunnel) dial(ctx context.Context, host, port string) (net.Conn, error) 
 		lastErr = err
 	}
 	return nil, lastErr
-}
-
-func (t *tunnel) resolve(ctx context.Context, host string, gatewayActive bool, prefixes []netip.Prefix) ([]netip.Addr, error) {
-	return resolveDestination(host, gatewayActive, prefixes,
-		t.o.ResolveAlias,
-		func(name string) ([]string, error) {
-			tnet := t.o.Net()
-			if tnet == nil {
-				return nil, errTunnelDown
-			}
-			return tnet.LookupContextHost(ctx, name)
-		})
 }
 
 // resolveDestination applies the helper proxy rules of docs/PROTOCOL.md.

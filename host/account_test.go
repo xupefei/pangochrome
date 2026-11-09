@@ -29,7 +29,7 @@ func TestAccountStoreRoundTrip(t *testing.T) {
 	}
 	want := &account{
 		Server: "https://p.example.com", SessionToken: "tok", UserID: "u1", Email: "a@example.com",
-		OrgID: "acme", Olm: pangolin.OlmCredentials{ID: "olm1", Secret: "s"}, ExitNodes: map[string]int{"acme": 5},
+		OrgID: "acme", Olm: pangolin.OlmCredentials{ID: "olm1", Secret: "s"}, ExitNodes: map[string]exitNodeChoice{"acme": {SiteResourceID: 5, Name: "Home"}},
 	}
 	if err := s.save(want); err != nil {
 		t.Fatal(err)
@@ -42,7 +42,7 @@ func TestAccountStoreRoundTrip(t *testing.T) {
 		t.Errorf("account file mode = %v, want 0600", fi.Mode().Perm())
 	}
 	got, err := s.load()
-	if err != nil || got.SessionToken != "tok" || got.Olm.ID != "olm1" || got.ExitNodes["acme"] != 5 {
+	if err != nil || got.SessionToken != "tok" || got.Olm.ID != "olm1" || got.ExitNodes["acme"] != (exitNodeChoice{SiteResourceID: 5, Name: "Home"}) {
 		t.Fatalf("load = %+v, %v", got, err)
 	}
 	if err := s.remove(); err != nil {

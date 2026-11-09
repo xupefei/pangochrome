@@ -72,7 +72,7 @@ func runHost(in io.Reader) int {
 	}
 
 	s := &server{version: version, baseDir: baseDir, out: out, userAgnt: "pangochrome-helper/" + version}
-	s.tun, err = newTunnel(version, tunnelEvents{
+	s.tun = newTunnel(version, tunnelEvents{
 		changed:   s.pushState,
 		connected: func() { go s.onTunnelConnected() },
 		stopped: func(reason string) {
@@ -84,10 +84,6 @@ func runHost(in io.Reader) int {
 			s.pushState()
 		},
 	})
-	if err != nil {
-		log.Printf("start olm: %v", err)
-		return 1
-	}
 	s.proxy, err = newLocalProxy(s.tun.dial)
 	if err != nil {
 		log.Printf("start proxy: %v", err)

@@ -22,8 +22,13 @@ type account struct {
 	Name         string                  `json:"name,omitempty"`
 	OrgID        string                  `json:"orgId,omitempty"`
 	Olm          pangolin.OlmCredentials `json:"olm"`
-	// ExitNodes maps an org ID to the chosen gateway site resource ID.
-	ExitNodes map[string]int `json:"exitNodes,omitempty"`
+	// ExitNodes maps an org ID to the chosen exit node of that org.
+	ExitNodes map[string]exitNodeChoice `json:"exitNodes,omitempty"`
+}
+
+type exitNodeChoice struct {
+	SiteResourceID int    `json:"siteResourceId"`
+	Name           string `json:"name"`
 }
 
 var profileIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{8,64}$`)

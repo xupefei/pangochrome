@@ -503,14 +503,13 @@ func (s *server) connect() error {
 		return errors.New("choose an organisation first")
 	}
 	s.setError("")
-	s.tun.start(tunnelConfig{
+	return s.tun.start(tunnelConfig{
 		Server:    acct.Server,
 		OlmID:     acct.Olm.ID,
 		OlmSecret: acct.Olm.Secret,
 		UserToken: acct.SessionToken,
 		OrgID:     acct.OrgID,
 	})
-	return nil
 }
 
 // fetchGateways loads the gateway list of the current org and caches it.
@@ -592,12 +591,12 @@ func (s *server) setExitNode(id int) error {
 		return errors.New("the organisation changed, try again")
 	}
 	if s.acct.ExitNodes == nil {
-		s.acct.ExitNodes = map[string]int{}
+		s.acct.ExitNodes = map[string]exitNodeChoice{}
 	}
 	if id == 0 {
 		delete(s.acct.ExitNodes, acct.OrgID)
 	} else {
-		s.acct.ExitNodes[acct.OrgID] = id
+		s.acct.ExitNodes[acct.OrgID] = exitNodeChoice{SiteResourceID: id, Name: gw.Name}
 	}
 	s.lastErr = ""
 	saveErr := s.store.save(s.acct)
@@ -621,7 +620,7 @@ func (s *server) onTunnelConnected() {
 	if err != nil {
 		return
 	}
-	id := acct.ExitNodes[acct.OrgID]
+	id := acct.ExitNodes[acct.OrgID].SiteResourceID
 	if id == 0 {
 		return
 	}
@@ -695,10 +694,11 @@ func (s *server) state() stateView {
 	if v.Phase == "connected" {
 		v.Routes = ts.routes
 	}
-	if id := s.acct.ExitNodes[s.acct.OrgID]; id != 0 {
+	if choice := s.acct.ExitNodes[s.acct.OrgID]; choice.SiteResourceID != 0 {
+		id := choice.SiteResourceID
 		v.ExitNode = &exitNodeView{
 			SiteResourceID: id,
-			Name:           s.gateways[id].Name,
+			Name:           choice.Name,
 			Active:         v.Phase == "connected" && ts.gatewayActive && ts.gatewayID == id,
 		}
 	}
