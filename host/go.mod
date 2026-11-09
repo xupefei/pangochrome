@@ -35,3 +35,7 @@ require (
 
 // Upstream olm v1.10.2 with a netstack mode; see third_party/olm/PANGOCHROME.md.
 replace github.com/fosrl/olm => ./third_party/olm
+
+// newt v1.19.0 with NativeConfigDisabled honoured on Linux and Windows too,
+// which netstack mode relies on: https://github.com/xupefei/newt/tree/native-config-disabled
+replace github.com/fosrl/newt => github.com/xupefei/newt v0.0.0-20261109152647-b52ef9dbf45c

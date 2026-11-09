@@ -8,9 +8,9 @@ import (
 	"strings"
 
 	"github.com/fosrl/newt/logger"
+	"github.com/fosrl/newt/network"
 	"github.com/fosrl/newt/util"
 	olmDevice "github.com/fosrl/olm/device"
-	"github.com/fosrl/olm/hostnet"
 	"github.com/fosrl/olm/peers"
 	"github.com/fosrl/olm/websocket"
 )
@@ -88,7 +88,7 @@ func (o *Olm) connectExitNode(cfg ExitNodeConfig) error {
 	// one on mobile platforms (array order is what determines primary there).
 	// Bailing out here before touching the WireGuard device at all means there's
 	// never a half-configured peer left behind to roll back.
-	if err := hostnet.AddSecondaryAddress(interfaceName, tunnelIP); err != nil {
+	if err := network.AddSecondaryAddress(interfaceName, tunnelIP); err != nil {
 		return fmt.Errorf("failed to add secondary address %s for exit node: %w", tunnelIP, err)
 	}
 
@@ -120,7 +120,7 @@ persistent_keepalive_interval=%d`, util.FixKey(cfg.PublicKey), allowedIP, resolv
 	// tunnel too, and without an explicit source darwin picks that one instead,
 	// which the exit node's WireGuard AllowedIPs filtering then silently drops.
 	tunnelIPForRoute := strings.Split(cfg.TunnelIP, "/")[0]
-	if err := hostnet.AddRouteForServerIPWithSource(serverIPForRoute, interfaceName, tunnelIPForRoute); err != nil {
+	if err := network.AddRouteForServerIPWithSource(serverIPForRoute, interfaceName, tunnelIPForRoute); err != nil {
 		logger.Warn("Failed to add route for exit node server IP: %v", err)
 	}
 
@@ -283,7 +283,7 @@ func (o *Olm) removeExitNodePeerLocked() error {
 
 	serverIPForRoute := strings.Split(cfg.ServerIP, "/")[0] + "/32"
 	tunnelIPForRoute := strings.Split(cfg.TunnelIP, "/")[0]
-	if err := hostnet.RemoveRouteForServerIPWithSource(serverIPForRoute, interfaceName, tunnelIPForRoute); err != nil {
+	if err := network.RemoveRouteForServerIPWithSource(serverIPForRoute, interfaceName, tunnelIPForRoute); err != nil {
 		logger.Warn("Failed to remove route for exit node server IP: %v", err)
 	}
 
@@ -291,7 +291,7 @@ func (o *Olm) removeExitNodePeerLocked() error {
 	if !strings.Contains(tunnelIP, "/") {
 		tunnelIP += "/32"
 	}
-	if err := hostnet.RemoveSecondaryAddress(interfaceName, tunnelIP); err != nil {
+	if err := network.RemoveSecondaryAddress(interfaceName, tunnelIP); err != nil {
 		logger.Warn("Failed to remove secondary address %s for exit node: %v", tunnelIP, err)
 	}
 

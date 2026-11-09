@@ -28,7 +28,6 @@ import (
 	olmDevice "github.com/fosrl/olm/device"
 	"github.com/fosrl/olm/dns"
 	dnsOverride "github.com/fosrl/olm/dns/override"
-	"github.com/fosrl/olm/hostnet"
 	"github.com/fosrl/olm/peers"
 	"github.com/fosrl/olm/subnetrouter"
 	"github.com/fosrl/olm/websocket"
@@ -272,9 +271,7 @@ func Init(ctx context.Context, config OlmConfig) (*Olm, error) {
 		config.WakeUpDebounce = 3 * time.Second
 	}
 
-	if config.Netstack {
-		hostnet.Disable()
-	} else {
+	if !config.Netstack {
 		logger.Debug("Checking permissions for native interface")
 		if err := permissions.CheckNativeInterfacePermissions(); err != nil {
 			logger.Fatal("Insufficient permissions to create native TUN interface: %v", err)

@@ -2,6 +2,8 @@
 
 Upstream: https://github.com/fosrl/olm, tag `v1.10.2` (commit `eee8873`).
 Licence: AGPL-3.0 (see `LICENSE`).
+The same patch, as separate commits: branch `netstack-mode` of
+https://github.com/xupefei/olm.
 
 The patch adds a netstack mode. In netstack mode olm runs its WireGuard
 device on a userspace TCP/IP stack (`golang.zx2c4.com/wireguard/tun/netstack`)
@@ -13,18 +15,23 @@ Enable it with `OlmConfig.Netstack = true`. In netstack mode `StartTunnel`
 forces `NativeDNSManaged` on and `OverrideDNS`, `EnableUAPI` and
 `SubnetRouter` off, so a server push cannot change host DNS either.
 
+Host routes and addresses are left alone through newt's existing
+`network.NativeConfigDisabled` flag, which olm already sets when it is handed
+a TUN file descriptor. Upstream newt v1.19.0 honours that flag only on macOS,
+so `go.mod` (here and in `host/`) replaces newt with
+https://github.com/xupefei/newt/tree/native-config-disabled, which honours it
+on Linux and Windows too.
+
 ## Changes
 
-- `hostnet/` (new): wraps every host network change olm makes. After
-  `hostnet.Disable()` each wrapper is a no-op. `olm/connect.go`,
-  `olm/exitnode.go` and `peers/manager.go` call these wrappers instead of
-  `github.com/fosrl/newt/network`. Only the package prefix changes.
-- `olm/olm.go`: `Init` skips the TUN permission check and calls
-  `hostnet.Disable()` in netstack mode. `StartTunnel` forces the flags above.
-  `Close` clears the published stack first.
-- `olm/connect.go`: `handleConnect` creates the netstack device in netstack
-  mode and publishes the stack when the connection is ready. It also assigns
-  `o.peerManager` under `peerManagerMu`, which its readers already take.
+- `go.mod`, `go.sum`: the newt replace above.
+- `olm/connect.go`: `handleConnect` sets `network.NativeConfigDisabled` in
+  netstack mode, creates the netstack device and publishes the stack when the
+  connection is ready. It also assigns `o.peerManager` under
+  `peerManagerMu`, which its readers already take.
+- `olm/olm.go`: `Init` skips the TUN permission check in netstack mode.
+  `StartTunnel` forces the flags above. `Close` clears the published stack
+  first.
 - `api/api.go`: `GetStatus` takes `statusMu` and returns copies. Without
   the lock, a status read during a peer update can stop the process with
   "concurrent map read and map write".
@@ -43,13 +50,16 @@ forces `NativeDNSManaged` on and `OverrideDNS`, `EnableUAPI` and
   has a second tunnel address. The netstack device has only the primary
   address. olm's MiddleDevice NAT may make this work anyway, but it is not
   tested. Gateway exit nodes only need the `0.0.0.0/0` WireGuard claim.
-- `hostnet.Disable` is process-wide and cannot be undone, so one process
-  runs either TUN mode or netstack mode.
+- `network.NativeConfigDisabled` is process-wide, so one process runs either
+  TUN mode or netstack mode.
 
 ## Update to a new olm release
 
 1. Diff this directory against `v1.10.2` to get the patch:
-   `git diff 35a1544 -- host/third_party/olm`.
+   `git diff 664f46d -- host/third_party/olm`.
 2. Replace the directory with the new release and apply the patch.
-3. Run `go test ./...` in `host/`. `TestOlmHostNetworkCallsUseHostnet` fails if
-   olm calls a host-changing `newt/network` function directly.
+3. Run `go test ./...` in `host/`.
+   `TestOlmUsesOnlyReviewedNetworkSymbols` fails if olm starts using a
+   `newt/network` symbol nobody has checked for netstack mode, or stops
+   setting `NativeConfigDisabled` there. `TestNewtHonoursNativeConfigDisabled`
+   fails if the newt in use still changes the host with the flag set.

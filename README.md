@@ -20,7 +20,8 @@ Pangochrome has two parts:
   extension can use.
 
 The olm copy in `host/third_party/olm` has a small patch that adds this
-userspace mode. See `host/third_party/olm/PANGOCHROME.md`.
+userspace mode, and the helper uses a newt build in which that mode leaves the
+host's routes alone on every platform. See `host/third_party/olm/PANGOCHROME.md`.
 `docs/PROTOCOL.md` defines the messages between the two parts and the
 routing rules.
 

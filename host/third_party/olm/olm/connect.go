@@ -15,7 +15,6 @@ import (
 	"github.com/fosrl/newt/util"
 	olmDevice "github.com/fosrl/olm/device"
 	"github.com/fosrl/olm/dns"
-	"github.com/fosrl/olm/hostnet"
 	"github.com/fosrl/olm/peers"
 	"github.com/fosrl/olm/subnetrouter"
 	"github.com/fosrl/olm/websocket"
@@ -90,8 +89,9 @@ func (o *Olm) handleConnect(msg websocket.WSMessage) {
 	// competing routes to the same destination. On macOS specifically this
 	// package's darwin code paths would otherwise run for real here (the NE
 	// build shares GOOS=darwin with the CLI), unlike iOS where they're already
-	// no-ops via a GOOS check.
-	network.NativeConfigDisabled = o.tunnelConfig.FileDescriptorTun != 0
+	// no-ops via a GOOS check. In netstack mode there is no OS interface at
+	// all, so nothing on the host may be configured either.
+	network.NativeConfigDisabled = o.olmConfig.Netstack || o.tunnelConfig.FileDescriptorTun != 0
 
 	o.tdev, err = func() (tun.Device, error) {
 		if o.olmConfig.Netstack {
@@ -204,7 +204,7 @@ func (o *Olm) handleConnect(msg websocket.WSMessage) {
 		o.dnsMonitor.SetExcludeIP(o.dnsProxy.GetProxyIP())
 	}
 
-	if err = hostnet.ConfigureInterface(o.tunnelConfig.InterfaceName, wgData.TunnelIP, o.tunnelConfig.MTU); err != nil {
+	if err = network.ConfigureInterface(o.tunnelConfig.InterfaceName, wgData.TunnelIP, o.tunnelConfig.MTU); err != nil {
 		logger.Error("Failed to o.tunnelConfigure interface: %v", err)
 	}
 
@@ -221,7 +221,7 @@ func (o *Olm) handleConnect(msg websocket.WSMessage) {
 	// DisableRoutesAndAliasesOnExitNode - which only gates routes/aliases for
 	// individual site resources, applied dynamically below as the peer
 	// manager is told about the exit node's connection state.
-	if err := hostnet.AddRoutesWithSource([]string{wgData.UtilitySubnet}, o.tunnelConfig.InterfaceName, interfaceIP); err != nil { // also route the utility subnet
+	if err := network.AddRoutesWithSource([]string{wgData.UtilitySubnet}, o.tunnelConfig.InterfaceName, interfaceIP); err != nil { // also route the utility subnet
 		logger.Error("Failed to add route for utility subnet: %v", err)
 	}
 

@@ -5,6 +5,11 @@ host/third_party/olm is olm (https://github.com/fosrl/olm), Copyright
 Fossorial, Inc., licensed under the GNU Affero General Public License v3.0,
 with the changes described in host/third_party/olm/PANGOCHROME.md.
 
+The helper also includes newt (https://github.com/fosrl/newt), Copyright
+Fossorial, Inc., licensed under the GNU Affero General Public License v3.0,
+built from https://github.com/xupefei/newt/tree/native-config-disabled (one
+change, also described in PANGOCHROME.md).
+
 extension/src/native.ts and extension/src/proxy-auth.ts contain code adapted
 from tailchrome (https://github.com/dantraynor/tailchrome), used under this
 licence:
