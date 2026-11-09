@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "Pangochrome",
+  "version": "0.1.0",
+  "description": "Reach Pangolin private sites through the Pangochrome helper.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0qMCcUDps46j4NvigAxAJZ3ZiT6uq9Ns0qEco6vRvx9EuybLqVwXLIZ8R+B8SyRzTMBPU8rh7qVK0e+ePW6oCzACCxFiuB5B80dY9yMBT3Hp6pkaeeBCv96lOXJermzBKdx4ElHVtF7PGGc9m9tQPwiiqm53YD1hCJniz53LyDwjyub+fp69OD1buzp/s33Ev+BF4pZ93vYD3Z/Ks4VpsyedkMU5UQM2k8cEBuWSWsZl8aC4A6OiV3RtRizS9nLl7miEyjyUB5AFVbwaVA/SApyAlix/BrvCcrrEFsCoYQQZfEnGZAqOdyAo/hxjuoSSaGo6Yg6gMv3zz4Jk+iYGEQIDAQAB",
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Pangochrome",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "permissions": [
+    "nativeMessaging",
+    "proxy",
+    "storage",
+    "webRequest",
+    "webRequestAuthProvider"
+  ],
+  "host_permissions": ["<all_urls>"]
+}

@@ -1,0 +1,19 @@
+{
+  "name": "pangochrome-extension",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Chrome extension for Pangochrome: login, routing and proxy control for the Pangochrome helper.",
+  "scripts": {
+    "build": "node build.mjs",
+    "icons": "node scripts/make-icons.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.3.7",
+    "@types/node": "^24.19.2",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.12"
+  }
+}
