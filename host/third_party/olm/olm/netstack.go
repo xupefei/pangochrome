@@ -30,7 +30,7 @@ func (o *Olm) createNetstackTUN(tunnelIP string) (tun.Device, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid tunnel IP %q: %w", tunnelIP, err)
 	}
-	tdev, tnet, err := netstack.CreateNetTUN([]netip.Addr{addr}, o.olmConfig.NetstackDNS, o.tunnelConfig.MTU)
+	tdev, tnet, err := netstack.CreateNetTUN([]netip.Addr{addr}, nil, o.tunnelConfig.MTU)
 	if err != nil {
 		return nil, err
 	}

@@ -30,7 +30,7 @@ forces `NativeDNSManaged` on and `OverrideDNS`, `EnableUAPI` and
   "concurrent map read and map write".
 - `olm/netstack.go` (new): device creation and the `Net`, `ResolveAlias`,
   `AliasNames` and `Sites` accessors.
-- `olm/types.go`: `OlmConfig.Netstack` and `OlmConfig.NetstackDNS`.
+- `olm/types.go`: `OlmConfig.Netstack`.
 - `dns/resolve_local.go` (new): `DNSProxy.ResolveLocal`, an in-process alias
   lookup that also starts a just-in-time site connection, and
   `DNSProxy.LocalNames`, the list of alias names.

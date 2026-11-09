@@ -31,6 +31,12 @@ var cgnatPrefix = netip.MustParsePrefix("100.64.0.0/10")
 // through the tunnel and leave through the exit node.
 var exitNodeDNS = []netip.Addr{netip.MustParseAddr("1.1.1.1"), netip.MustParseAddr("8.8.8.8")}
 
+// tunnelMTU is the MTU inside the tunnel. With WireGuard over IPv6 (80 bytes
+// of headers) a packet is then 1280 bytes, the IPv6 minimum, so it fits any
+// path. Pangolin's default of 1280 does not fit behind VPNs with an MTU of
+// 1300, which drop every full-size TCP segment.
+const tunnelMTU = 1200
+
 type tunnelConfig struct {
 	Server    string
 	OlmID     string
@@ -83,11 +89,10 @@ func (t *tunnel) start(cfg tunnelConfig) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	run := &tunnelRun{cancel: cancel, done: make(chan struct{})}
 	o, err := olm.Init(ctx, olm.OlmConfig{
-		LogLevel:    "INFO",
-		Agent:       "Pangochrome",
-		Version:     t.version,
-		Netstack:    true,
-		NetstackDNS: exitNodeDNS,
+		LogLevel: "INFO",
+		Agent:    "Pangochrome",
+		Version:  t.version,
+		Netstack: true,
 		OnConnected: func() {
 			t.events.connected()
 			t.events.changed()
@@ -112,7 +117,7 @@ func (t *tunnel) start(cfg tunnelConfig) error {
 			Secret:    cfg.OlmSecret,
 			UserToken: cfg.UserToken,
 			OrgID:     cfg.OrgID,
-			MTU:       1280,
+			MTU:       tunnelMTU,
 			Holepunch: true,
 			// Never touch the host resolver: the browser reaches aliases
 			// through the proxy, not through system DNS.
@@ -384,7 +389,11 @@ func (t *tunnel) dial(ctx context.Context, host, port string) (net.Conn, error) 
 	host = normaliseName(strings.Trim(host, "[]"))
 	addrs, err := resolveDestination(host, o.GetStatus().GatewayActive, sitePrefixes(o.Sites()),
 		o.ResolveAlias,
-		func(name string) ([]string, error) { return tnet.LookupContextHost(ctx, name) })
+		func(name string) ([]string, error) {
+			return lookupOverTCP(ctx, exitNodeDNS, name, func(ctx context.Context, server netip.AddrPort) (net.Conn, error) {
+				return tnet.DialContextTCPAddrPort(ctx, server)
+			})
+		})
 	if err != nil {
 		return nil, err
 	}
@@ -395,6 +404,37 @@ func (t *tunnel) dial(ctx context.Context, host, port string) (net.Conn, error) 
 			return c, nil
 		}
 		lastErr = err
+	}
+	return nil, lastErr
+}
+
+// lookupOverTCP returns the IPv4 addresses of name, asking each server in
+// turn over DNS-over-TCP. Exit nodes do not always forward UDP, and TCP also
+// carries answers that do not fit in a UDP response.
+func lookupOverTCP(ctx context.Context, servers []netip.Addr, name string, dial func(context.Context, netip.AddrPort) (net.Conn, error)) ([]string, error) {
+	var lastErr error
+	for _, server := range servers {
+		r := &net.Resolver{
+			PreferGo: true,
+			// The Go resolver uses stream framing for a conn that is not a
+			// net.PacketConn, so every query goes over TCP to this server.
+			Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return dial(ctx, netip.AddrPortFrom(server, 53))
+			},
+		}
+		// The trailing dot keeps the host's search domains out of the query.
+		addrs, err := r.LookupNetIP(ctx, "ip4", strings.TrimSuffix(name, ".")+".")
+		if err == nil {
+			out := make([]string, 0, len(addrs))
+			for _, a := range addrs {
+				out = append(out, a.Unmap().String())
+			}
+			return out, nil
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			break
+		}
 	}
 	return nil, lastErr
 }

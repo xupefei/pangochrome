@@ -5,6 +5,7 @@ go 1.26.0
 require (
 	github.com/fosrl/newt v1.19.0
 	github.com/fosrl/olm v1.10.2
+	github.com/miekg/dns v1.1.73
 )
 
 require (
@@ -16,7 +17,6 @@ require (
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/mdlayher/netlink v1.7.3-0.20250113171957-fbb4dce95f42 // indirect
 	github.com/mdlayher/socket v0.5.1 // indirect
-	github.com/miekg/dns v1.1.73 // indirect
 	github.com/vishvananda/netlink v1.3.1 // indirect
 	github.com/vishvananda/netns v0.0.5 // indirect
 	golang.org/x/crypto v0.58.0 // indirect
