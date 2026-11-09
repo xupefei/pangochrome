@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -51,7 +52,8 @@ func IsStatus(err error, status int) bool {
 
 // NormalizeServer turns user input such as "pangolin.example.com" into
 // "https://pangolin.example.com". The olm websocket ignores URL paths, so a
-// path is rejected.
+// path is rejected. Plain http is allowed only for a loopback server, because
+// the session cookie would travel in clear text.
 func NormalizeServer(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -64,13 +66,21 @@ func NormalizeServer(raw string) (string, error) {
 	if err != nil || u.Host == "" {
 		return "", fmt.Errorf("%q is not a valid server address", raw)
 	}
-	if u.Scheme != "https" && u.Scheme != "http" {
+	if u.Scheme != "https" && !(u.Scheme == "http" && isLoopback(u.Hostname())) {
 		return "", errors.New("the server address must start with https://")
 	}
 	if strings.Trim(u.Path, "/") != "" || u.RawQuery != "" || u.Fragment != "" {
 		return "", errors.New("the server address must not contain a path")
 	}
 	return u.Scheme + "://" + u.Host, nil
+}
+
+func isLoopback(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip, err := netip.ParseAddr(host)
+	return err == nil && ip.IsLoopback()
 }
 
 type envelope struct {
@@ -181,7 +191,12 @@ func (c *Client) StartDeviceLogin(ctx context.Context, deviceName string) (Devic
 	if out.Code == "" {
 		return DeviceCode{}, errors.New("the server did not return a login code")
 	}
-	return DeviceCode{Code: out.Code, ExpiresAt: time.Now().Add(time.Duration(out.ExpiresInSeconds) * time.Second)}, nil
+	// Pangolin codes live for 5 minutes.
+	ttl := 5 * time.Minute
+	if out.ExpiresInSeconds > 0 {
+		ttl = time.Duration(out.ExpiresInSeconds) * time.Second
+	}
+	return DeviceCode{Code: out.Code, ExpiresAt: time.Now().Add(ttl)}, nil
 }
 
 // ErrCodeExpired means the device code expired or the server no longer knows it.
@@ -293,9 +308,9 @@ type Gateway struct {
 // ListGateways returns the enabled gateway resources of the org that have at
 // least one site.
 func (c *Client) ListGateways(ctx context.Context, orgID string) ([]Gateway, error) {
-	const pageSize = 100
+	const pageSize, maxPages = 100, 50
 	var all []Gateway
-	for page := 1; ; page++ {
+	for page := 1; page <= maxPages; page++ {
 		var out struct {
 			SiteResources []Gateway `json:"siteResources"`
 		}
@@ -316,4 +331,5 @@ func (c *Client) ListGateways(ctx context.Context, orgID string) ([]Gateway, err
 			return all, nil
 		}
 	}
+	return all, nil
 }

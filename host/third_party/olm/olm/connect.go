@@ -232,7 +232,7 @@ func (o *Olm) handleConnect(msg websocket.WSMessage) {
 	// PeerManager.SetExitNode/SetGateway - rather than being pre-seeded here,
 	// so a failed initial exit-node/gateway setup can never leave routes
 	// stuck suppressed with nothing active to justify it.
-	o.peerManager = peers.NewPeerManager(peers.PeerManagerConfig{
+	pm := peers.NewPeerManager(peers.PeerManagerConfig{
 		Device:                            o.dev,
 		DNSProxy:                          o.dnsProxy,
 		InterfaceName:                     o.tunnelConfig.InterfaceName,
@@ -245,6 +245,9 @@ func (o *Olm) handleConnect(msg websocket.WSMessage) {
 		PublicDNS:                         o.tunnelConfig.PublicDNS,
 		DisableRoutesAndAliasesOnExitNode: o.tunnelConfig.DisableRoutesAndAliasesOnExitNode,
 	})
+	o.peerManagerMu.Lock()
+	o.peerManager = pm
+	o.peerManagerMu.Unlock()
 
 	for i := range wgData.Sites {
 		site := wgData.Sites[i]

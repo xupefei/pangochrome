@@ -512,6 +512,13 @@ func (o *Olm) StartTunnel(config TunnelConfig) {
 	logger.Debug("Starting tunnel with config: %+v", config)
 
 	o.tunnelRunning = true // Also set it here in case it is called externally
+	if o.olmConfig.Netstack {
+		// Netstack mode owns no OS interface, so none of these can apply.
+		config.NativeDNSManaged = true
+		config.OverrideDNS = false
+		config.EnableUAPI = false
+		config.SubnetRouter = false
+	}
 	o.tunnelConfig = config
 	network.PreferLocalRoutes = config.PreferLocalRoutes
 

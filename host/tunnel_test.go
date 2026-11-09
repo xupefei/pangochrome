@@ -68,8 +68,13 @@ func TestResolveDestination(t *testing.T) {
 		return a, ok
 	}
 	lookup := func(name string) ([]string, error) {
-		if name == "example.com" {
+		switch name {
+		case "example.com":
 			return []string{"2606:4700::1", "93.184.215.14", "127.0.0.1"}, nil
+		case "rebind.example":
+			return []string{"10.1.0.5"}, nil
+		case "cgnat.example":
+			return []string{"100.96.128.10"}, nil
 		}
 		return nil, errors.New("no such host")
 	}
@@ -92,6 +97,8 @@ func TestResolveDestination(t *testing.T) {
 		{"link-local with exit node", "169.254.1.1", true, nil, errNotAllowed},
 		{"public name with exit node keeps usable IPv4 only", "example.com", true, []string{"93.184.215.14"}, nil},
 		{"alias wins over exit node", "nas.internal", true, []string{"100.96.128.10"}, nil},
+		{"public name pointing into a site subnet", "rebind.example", true, nil, errNotAllowed},
+		{"public name pointing at Pangolin addresses", "cgnat.example", true, nil, errNotAllowed},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -122,5 +129,19 @@ func TestResolveDestinationLookupFailure(t *testing.T) {
 		func(string) ([]string, error) { return nil, errors.New("timeout") })
 	if err == nil || errors.Is(err, errNotAllowed) {
 		t.Fatalf("err = %v, want a resolution error", err)
+	}
+}
+
+func TestBuildSitesOrderIsStable(t *testing.T) {
+	// Two sites with the same name share an alias.
+	a := peers.SiteConfig{SiteId: 7, Name: "Edge", Aliases: []peers.Alias{{Alias: "app.internal"}}}
+	b := peers.SiteConfig{SiteId: 3, Name: "Edge", Aliases: []peers.Alias{{Alias: "app.internal"}}}
+	first := buildSites([]peers.SiteConfig{a, b}, nil, nil)
+	second := buildSites([]peers.SiteConfig{b, a}, nil, nil)
+	if !reflect.DeepEqual(first, second) {
+		t.Fatalf("order depends on input order:\n%+v\n%+v", first, second)
+	}
+	if first[0].SiteID != 3 || len(first[0].Aliases) != 1 || len(first[1].Aliases) != 0 {
+		t.Fatalf("shared alias should go to the lower site ID: %+v", first)
 	}
 }

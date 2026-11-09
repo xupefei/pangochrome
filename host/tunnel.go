@@ -19,7 +19,13 @@ import (
 	"github.com/fosrl/olm/peers"
 )
 
-var errTunnelDown = errors.New("tunnel is not connected")
+var (
+	errTunnelDown = errors.New("tunnel is not connected")
+	errBadPort    = errors.New("invalid port")
+)
+
+// Pangolin puts client and alias addresses in this range.
+var cgnatPrefix = netip.MustParsePrefix("100.64.0.0/10")
 
 // Resolvers for non-alias names while an exit node is active. Queries go
 // through the tunnel and leave through the exit node.
@@ -33,12 +39,13 @@ type tunnelConfig struct {
 	OrgID     string
 }
 
-// tunnelEvents are called from olm goroutines.
+// tunnelEvents are called from olm goroutines and from stop, never with a
+// tunnel lock held.
 type tunnelEvents struct {
-	changed   func()               // status may have changed
-	connected func()               // the tunnel finished registration
-	stopped   func(reason string)  // olm ended the tunnel on its own
-	authError func(message string) // the server rejected the session
+	changed   func()              // status may have changed
+	connected func()              // the tunnel finished registration
+	stopped   func(reason string) // olm ended the tunnel on its own
+	authError func()              // the server refused olm's token request
 }
 
 // tunnel runs at most one netstack olm at a time. Each connection gets its
@@ -48,8 +55,11 @@ type tunnel struct {
 	version string
 	events  tunnelEvents
 
-	mu  sync.Mutex
-	run *tunnelRun
+	// life makes start and teardown run one at a time, so a new tunnel never
+	// starts while the previous one is still tearing down.
+	life sync.Mutex
+	mu   sync.Mutex
+	run  *tunnelRun
 }
 
 type tunnelRun struct {
@@ -63,6 +73,8 @@ func newTunnel(version string, events tunnelEvents) *tunnel {
 }
 
 func (t *tunnel) start(cfg tunnelConfig) error {
+	t.life.Lock()
+	defer t.life.Unlock()
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.run != nil {
@@ -83,7 +95,7 @@ func (t *tunnel) start(cfg tunnelConfig) error {
 		OnTerminated: func() { t.endedByOlm(run, "The server ended the connection.") },
 		OnAuthError: func(status int, message string) {
 			go t.stopRun(run)
-			t.events.authError(message)
+			t.events.authError()
 		},
 		OnOlmError: func(code, message string) { t.events.changed() },
 	})
@@ -116,7 +128,7 @@ func (t *tunnel) start(cfg tunnelConfig) error {
 	return nil
 }
 
-// stop blocks until the current tunnel is torn down.
+// stop returns when the current tunnel is torn down.
 func (t *tunnel) stop() {
 	t.mu.Lock()
 	run := t.run
@@ -129,9 +141,11 @@ func (t *tunnel) stop() {
 // stopRun tears down run if it is still the current tunnel. Cancelling the
 // context ends StartTunnel first, so StopTunnel never overlaps its setup.
 func (t *tunnel) stopRun(run *tunnelRun) {
+	t.life.Lock()
 	t.mu.Lock()
 	if t.run != run {
 		t.mu.Unlock()
+		t.life.Unlock()
 		return
 	}
 	t.run = nil
@@ -140,6 +154,7 @@ func (t *tunnel) stopRun(run *tunnelRun) {
 	run.cancel()
 	<-run.done
 	_ = run.o.StopTunnel()
+	t.life.Unlock()
 	t.events.changed()
 }
 
@@ -171,6 +186,32 @@ func (t *tunnel) current() *olm.Olm {
 }
 
 func (t *tunnel) isRunning() bool { return t.current() != nil }
+
+// gatewayState is the part of the status that the exit-node reconcile needs.
+type gatewayState struct {
+	registered   bool
+	active       bool
+	id           int
+	trackedSites map[int]bool // site IDs that are connected peers
+}
+
+func (t *tunnel) gatewayState() gatewayState {
+	o := t.current()
+	if o == nil {
+		return gatewayState{}
+	}
+	st := o.GetStatus()
+	gs := gatewayState{
+		registered:   st.Registered,
+		active:       st.GatewayActive,
+		id:           st.GatewaySiteResourceId,
+		trackedSites: map[int]bool{},
+	}
+	for _, sc := range o.Sites() {
+		gs.trackedSites[sc.SiteId] = true
+	}
+	return gs
+}
 
 func (t *tunnel) selectExitNode(siteResourceID int, siteIDs []int) error {
 	o := t.current()
@@ -243,6 +284,15 @@ func normaliseName(name string) string {
 // that connect just in time have no site yet, so they go under a site with
 // ID 0.
 func buildSites(connected []peers.SiteConfig, statuses map[int]*api.PeerStatus, aliasNames []string) []siteState {
+	// Sort first: an alias that two sites share belongs to the first one,
+	// and the result must not change between calls.
+	connected = slices.Clone(connected)
+	sort.Slice(connected, func(i, j int) bool {
+		if connected[i].Name != connected[j].Name {
+			return connected[i].Name < connected[j].Name
+		}
+		return connected[i].SiteId < connected[j].SiteId
+	})
 	out := []siteState{}
 	seen := map[string]bool{}
 	for _, sc := range connected {
@@ -264,7 +314,6 @@ func buildSites(connected []peers.SiteConfig, statuses map[int]*api.PeerStatus, 
 		sort.Strings(s.Aliases)
 		out = append(out, s)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 
 	onDemand := siteState{Name: "Connects on first use", Aliases: []string{}}
 	for _, n := range aliasNames {
@@ -330,7 +379,7 @@ func (t *tunnel) dial(ctx context.Context, host, port string) (net.Conn, error) 
 	}
 	portNum, err := strconv.ParseUint(port, 10, 16)
 	if err != nil || portNum == 0 {
-		return nil, fmt.Errorf("invalid port %q", port)
+		return nil, fmt.Errorf("%w %q", errBadPort, port)
 	}
 	host = normaliseName(strings.Trim(host, "[]"))
 	addrs, err := resolveDestination(host, o.GetStatus().GatewayActive, sitePrefixes(o.Sites()),
@@ -376,13 +425,27 @@ func resolveDestination(
 		return nil, fmt.Errorf("cannot resolve %s through the exit node: %w", host, err)
 	}
 	var addrs []netip.Addr
+	refused := false
 	for _, n := range names {
-		if ip, err := netip.ParseAddr(n); err == nil && ipAllowed(ip.Unmap(), true, nil) {
-			addrs = append(addrs, ip.Unmap())
+		ip, err := netip.ParseAddr(n)
+		if err != nil {
+			continue
+		}
+		ip = ip.Unmap()
+		// A public name must not point into a site network or at Pangolin
+		// addresses, or a web page could reach them as its own origin.
+		if inPrefixes(ip, prefixes) || cgnatPrefix.Contains(ip) {
+			refused = true
+			continue
+		}
+		if ipAllowed(ip, true, nil) {
+			addrs = append(addrs, ip)
 		}
 	}
-	addrs = v4Only(addrs)
 	if len(addrs) == 0 {
+		if refused {
+			return nil, fmt.Errorf("%w: %s resolves into a Pangolin network", errNotAllowed, host)
+		}
 		return nil, fmt.Errorf("%s has no IPv4 address", host)
 	}
 	return addrs, nil
@@ -398,14 +461,21 @@ func v4Only(addrs []netip.Addr) []netip.Addr {
 	return out
 }
 
-func ipAllowed(ip netip.Addr, gatewayActive bool, prefixes []netip.Prefix) bool {
-	if !ip.Is4() {
-		return false
-	}
+func inPrefixes(ip netip.Addr, prefixes []netip.Prefix) bool {
 	for _, p := range prefixes {
 		if p.Contains(ip) {
 			return true
 		}
+	}
+	return false
+}
+
+func ipAllowed(ip netip.Addr, gatewayActive bool, prefixes []netip.Prefix) bool {
+	if !ip.Is4() {
+		return false
+	}
+	if inPrefixes(ip, prefixes) {
+		return true
 	}
 	if !gatewayActive {
 		return false

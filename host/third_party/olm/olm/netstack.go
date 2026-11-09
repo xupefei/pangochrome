@@ -13,8 +13,9 @@ import (
 )
 
 // netstackState is the userspace stack of the current connection.
-// handleConnect publishes it when the connection is ready, and Close clears
-// it before teardown starts, so callers never get a stack that is closing.
+// handleConnect publishes it when the connection is ready. Close clears it
+// before teardown starts, so Net returns nil from then on. Dials on a stack
+// obtained earlier fail once the device closes.
 type netstackState struct {
 	mu       sync.RWMutex
 	pending  *netstack.Net // created with the device, not yet published
@@ -63,8 +64,8 @@ func (o *Olm) Net() *netstack.Net {
 }
 
 // ResolveAlias returns the IPv4 addresses of a Pangolin DNS alias. Like a
-// DNS query to the olm DNS proxy, a match starts a just-in-time connection
-// to the site that owns the alias.
+// DNS query to the olm DNS proxy, a match also starts a just-in-time
+// connection to the site that owns the alias, if it is not connected.
 func (o *Olm) ResolveAlias(name string) ([]netip.Addr, bool) {
 	o.netstack.mu.RLock()
 	proxy := o.netstack.dnsProxy

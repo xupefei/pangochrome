@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -62,10 +61,15 @@ func newLocalProxy(dial dialFunc) (*localProxy, error) {
 				if err != nil {
 					return nil, err
 				}
+				// The transport's dial context does not end when the browser
+				// gives up, so bound it here.
+				ctx, cancel := context.WithTimeout(ctx, dialTimeout)
+				defer cancel()
 				return p.dial(ctx, host, port)
 			},
-			MaxIdleConnsPerHost:   4,
-			IdleConnTimeout:       60 * time.Second,
+			// Each request dials again, so each one passes the destination
+			// rules in effect at that moment.
+			DisableKeepAlives:     true,
 			ResponseHeaderTimeout: 2 * time.Minute,
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
@@ -162,30 +166,28 @@ func (p *localProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	pipe(client, upstream)
 }
 
-// pipe copies both ways until both directions finish, then closes both.
+// pipe copies both ways. When either direction ends, it closes both
+// connections, so a peer that never closes cannot hold the tunnel open.
 func pipe(a, b net.Conn) {
-	var wg sync.WaitGroup
-	wg.Add(2)
+	done := make(chan struct{}, 2)
 	copyHalf := func(dst, src net.Conn) {
-		defer wg.Done()
 		_, _ = io.Copy(dst, src)
-		if cw, ok := dst.(interface{ CloseWrite() error }); ok {
-			_ = cw.CloseWrite()
-		} else {
-			_ = dst.Close()
-		}
+		done <- struct{}{}
 	}
 	go copyHalf(a, b)
 	go copyHalf(b, a)
-	wg.Wait()
+	<-done
 	a.Close()
 	b.Close()
+	<-done
 }
 
 func writeDialError(w http.ResponseWriter, target string, err error) {
 	switch {
 	case errors.Is(err, errNotAllowed):
-		http.Error(w, target+" is not a Pangolin resource you can reach", http.StatusForbidden)
+		http.Error(w, target+" is not reachable through Pangolin now", http.StatusForbidden)
+	case errors.Is(err, errBadPort):
+		http.Error(w, "invalid port in "+target, http.StatusBadRequest)
 	case errors.Is(err, errTunnelDown):
 		http.Error(w, "the Pangolin tunnel is not connected", http.StatusBadGateway)
 	default:

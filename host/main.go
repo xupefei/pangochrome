@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -71,18 +72,15 @@ func runHost(in io.Reader) int {
 		log.Printf("logging: %v", err)
 	}
 
-	s := &server{version: version, baseDir: baseDir, out: out, userAgnt: "pangochrome-helper/" + version}
+	s := &server{version: version, baseDir: baseDir, out: out, userAgent: "pangochrome-helper/" + version}
 	s.tun = newTunnel(version, tunnelEvents{
 		changed:   s.pushState,
-		connected: func() { go s.onTunnelConnected() },
+		connected: func() { go s.reconcileExitNode() },
 		stopped: func(reason string) {
-			s.setError(reason)
+			s.setErrorIfNone(reason)
 			s.pushState()
 		},
-		authError: func(message string) {
-			s.sessionEnded()
-			s.pushState()
-		},
+		authError: func() { go s.onTunnelAuthError() },
 	})
 	s.proxy, err = newLocalProxy(s.tun.dial)
 	if err != nil {
@@ -90,14 +88,16 @@ func runHost(in io.Reader) int {
 		return 1
 	}
 	go func() {
-		if err := s.proxy.serve(); err != nil {
+		if err := s.proxy.serve(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("proxy stopped: %v", err)
 		}
 	}()
 
-	// olm reports peer and route changes only through its status, so poll it.
+	// olm reports peer, route and gateway changes only through its status,
+	// so poll it.
 	go func() {
 		for range time.Tick(time.Second) {
+			s.reconcileExitNode()
 			s.pushState()
 		}
 	}()
@@ -111,21 +111,36 @@ func runHost(in io.Reader) int {
 			break
 		}
 		var req request
-		if err := json.Unmarshal(msg, &req); err != nil || req.ID <= 0 || req.Cmd == "" {
-			log.Printf("ignoring malformed request")
+		if err := json.Unmarshal(msg, &req); err != nil || req.Cmd == "" {
+			if req.ID > 0 {
+				_ = out.send(reply{ID: req.ID, Error: "Invalid request."})
+			} else {
+				log.Printf("ignoring malformed request")
+			}
+			continue
+		}
+		if req.ID <= 0 {
+			log.Printf("ignoring request without id")
+			continue
+		}
+		if req.Cmd == "hello" {
+			// Answer hello before reading on, so that the next command
+			// already finds the profile.
+			s.handle(req)
 			continue
 		}
 		go s.handle(req)
 	}
 
 	// Chrome closed the port: the extension was unloaded or the browser quit.
+	out.close()
 	s.tun.stop()
 	_ = s.proxy.close()
 	return 0
 }
 
-// setUpLogging sends the helper's and olm's logs to <base>/helper.log. The
-// file restarts when it is over 5 MiB.
+// setUpLogging sends the helper's and olm's logs to <base>/helper.log. If
+// the file is over 5 MiB at start-up, it starts again empty.
 func setUpLogging(baseDir string) error {
 	if err := os.MkdirAll(baseDir, 0o700); err != nil {
 		return err

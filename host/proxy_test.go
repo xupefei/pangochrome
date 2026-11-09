@@ -27,6 +27,8 @@ func startProxy(t *testing.T, backend string) *localProxy {
 			return d.DialContext(ctx, "tcp", backend)
 		case "down.internal":
 			return nil, errors.New("connection refused")
+		case "badport.internal":
+			return nil, fmt.Errorf("%w %q", errBadPort, port)
 		default:
 			return nil, errNotAllowed
 		}
@@ -108,8 +110,9 @@ func TestProxyForwardsHTTP(t *testing.T) {
 func TestProxyRejectsAndReportsDialErrors(t *testing.T) {
 	p := startProxy(t, "127.0.0.1:1")
 	for host, want := range map[string]int{
-		"example.com":   http.StatusForbidden,
-		"down.internal": http.StatusBadGateway,
+		"example.com":      http.StatusForbidden,
+		"down.internal":    http.StatusBadGateway,
+		"badport.internal": http.StatusBadRequest,
 	} {
 		resp, err := proxyClient(p, true).Get("http://" + host + "/")
 		if err != nil {

@@ -7,11 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"pangochrome/host/pangolin"
 )
@@ -94,26 +97,40 @@ type loginFlow struct {
 }
 
 type server struct {
-	version  string
-	baseDir  string
-	out      *msgWriter
-	proxy    *localProxy
-	tun      *tunnel
-	userAgnt string
+	version   string
+	baseDir   string
+	out       *msgWriter
+	proxy     *localProxy
+	tun       *tunnel
+	userAgent string
 
-	mu       sync.Mutex
-	store    *accountStore
-	acct     *account
-	orgs     []pangolin.Org
-	login    *loginFlow
-	lastErr  string
-	gateways map[int]pangolin.Gateway // last gateway list of acct.OrgID
-	lastSent []byte
+	// cmdMu runs commands that change state one at a time.
+	cmdMu sync.Mutex
+	// pushMu keeps state events in the order their states were built.
+	pushMu sync.Mutex
+	// reconcileMu stops two exit-node reconciles from overlapping.
+	reconcileMu sync.Mutex
+
+	mu          sync.Mutex
+	store       *accountStore
+	acct        *account
+	orgs        []pangolin.Org
+	login       *loginFlow
+	lastErr     string
+	gateways    map[int]pangolin.Gateway // last gateway list of acct.OrgID
+	lastSent    []byte
+	exitRetryAt time.Time // no exit-node apply before this time
 }
 
 var errNotLoggedIn = errors.New("log in to Pangolin first")
 
+const sessionEndedMessage = "Your Pangolin session ended. Log in again."
+
 func (s *server) handle(req request) {
+	if changesState(req.Cmd) {
+		s.cmdMu.Lock()
+		defer s.cmdMu.Unlock()
+	}
 	result, err := s.dispatch(req)
 	r := reply{ID: req.ID, OK: err == nil, Result: result}
 	if err != nil {
@@ -128,13 +145,22 @@ func (s *server) handle(req request) {
 	s.pushState()
 }
 
+func changesState(cmd string) bool {
+	switch cmd {
+	case "hello", "getState", "listExitNodes":
+		return false
+	}
+	return true
+}
+
 // sentence turns a Go error string into UI text: capital first letter, full
 // stop at the end.
 func sentence(msg string) string {
 	if msg == "" {
 		return msg
 	}
-	msg = strings.ToUpper(msg[:1]) + msg[1:]
+	r, size := utf8.DecodeRuneInString(msg)
+	msg = string(unicode.ToUpper(r)) + msg[size:]
 	if !strings.HasSuffix(msg, ".") {
 		msg += "."
 	}
@@ -156,7 +182,8 @@ func (s *server) dispatch(req request) (any, error) {
 		s.cancelLogin()
 		return nil, nil
 	case "logout":
-		return nil, s.logout()
+		s.logout()
+		return nil, nil
 	case "selectOrg":
 		return nil, s.selectOrg(req.OrgID)
 	case "connect":
@@ -185,7 +212,16 @@ func (s *server) currentStore() *accountStore {
 
 func (s *server) setError(msg string) {
 	s.mu.Lock()
-	s.lastErr = msg
+	s.lastErr = sentence(msg)
+	s.mu.Unlock()
+}
+
+// setErrorIfNone keeps a more specific error that is already set.
+func (s *server) setErrorIfNone(msg string) {
+	s.mu.Lock()
+	if s.lastErr == "" {
+		s.lastErr = sentence(msg)
+	}
 	s.mu.Unlock()
 }
 
@@ -204,7 +240,7 @@ func (s *server) hello(profileID string) (any, error) {
 	acct, loadErr := store.load()
 	s.acct = acct
 	if loadErr != nil {
-		s.lastErr = loadErr.Error()
+		s.lastErr = sentence(loadErr.Error())
 	}
 	s.mu.Unlock()
 
@@ -223,8 +259,18 @@ func (s *server) hello(profileID string) (any, error) {
 }
 
 func (s *server) client(acct *account) *pangolin.Client {
-	c := &pangolin.Client{Server: acct.Server, Token: acct.SessionToken, UserAgent: s.userAgnt}
-	return c
+	return &pangolin.Client{Server: acct.Server, Token: acct.SessionToken, UserAgent: s.userAgent}
+}
+
+// copyAccount returns a copy that shares no map with a. Call it with s.mu
+// held.
+func copyAccount(a *account) *account {
+	if a == nil {
+		return nil
+	}
+	c := *a
+	c.ExitNodes = maps.Clone(a.ExitNodes)
+	return &c
 }
 
 // loggedIn returns a copy of the account, or an error when there is no
@@ -235,7 +281,12 @@ func (s *server) loggedIn() (account, error) {
 	if s.acct == nil || s.acct.SessionToken == "" {
 		return account{}, errNotLoggedIn
 	}
-	return *s.acct, nil
+	return *copyAccount(s.acct), nil
+}
+
+// sameSession reports whether the account still has this session.
+func (s *server) sameSession(token string) bool {
+	return s.acct != nil && s.acct.SessionToken != "" && s.acct.SessionToken == token
 }
 
 func (s *server) refreshOrgs() {
@@ -246,18 +297,29 @@ func (s *server) refreshOrgs() {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	orgs, err := s.client(&acct).ListOrgs(ctx, acct.UserID)
-	if err != nil {
-		if pangolin.IsStatus(err, http.StatusUnauthorized) {
-			s.sessionEnded()
-		} else {
-			s.setError("Cannot load organisations: " + err.Error())
+	switch {
+	case pangolin.IsStatus(err, http.StatusUnauthorized):
+		s.sessionEnded(acct.SessionToken)
+	case err != nil:
+		s.setError("Cannot load organisations: " + err.Error())
+	default:
+		s.mu.Lock()
+		if s.sameSession(acct.SessionToken) {
+			s.orgs = orgs
+			// The user may have left the saved org.
+			if !hasOrg(orgs, s.acct.OrgID) {
+				s.acct.OrgID = ""
+				if len(orgs) > 0 {
+					s.acct.OrgID = orgs[0].OrgID
+				}
+				s.gateways = nil
+				if err := s.store.save(s.acct); err != nil {
+					log.Printf("save account: %v", err)
+				}
+			}
 		}
-		s.pushState()
-		return
+		s.mu.Unlock()
 	}
-	s.mu.Lock()
-	s.orgs = orgs
-	s.mu.Unlock()
 	s.pushState()
 }
 
@@ -277,7 +339,7 @@ func (s *server) startLogin(rawServer string) (any, error) {
 	s.cancelLogin()
 	s.tun.stop()
 
-	c := &pangolin.Client{Server: serverURL, UserAgent: s.userAgnt}
+	c := &pangolin.Client{Server: serverURL, UserAgent: s.userAgent}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	code, err := c.StartDeviceLogin(ctx, deviceName())
 	cancel()
@@ -319,23 +381,21 @@ func (s *server) pollLogin(ctx context.Context, flow *loginFlow, c *pangolin.Cli
 		}
 		token, err := c.PollDeviceLogin(ctx, code)
 		if errors.Is(err, pangolin.ErrCodeExpired) {
-			s.endLogin(flow, err.Error())
+			s.endLogin(flow, "The login code expired. Start the login again.")
 			return
 		}
 		if err != nil {
-			if ctx.Err() != nil {
-				continue
+			if ctx.Err() == nil {
+				log.Printf("poll login: %v", err)
 			}
-			log.Printf("poll login: %v", err)
 			continue
 		}
 		if token == "" {
 			continue
 		}
 		c.Token = token
-		err = s.finishLogin(c)
 		msg := ""
-		if err != nil {
+		if err := s.finishLogin(flow, c); err != nil {
 			msg = "Login failed: " + err.Error()
 		}
 		s.endLogin(flow, msg)
@@ -349,14 +409,16 @@ func (s *server) endLogin(flow *loginFlow, errMsg string) {
 	if s.login == flow {
 		s.login = nil
 		if errMsg != "" {
-			s.lastErr = errMsg
+			s.lastErr = sentence(errMsg)
 		}
 	}
 	s.mu.Unlock()
 	s.pushState()
 }
 
-func (s *server) finishLogin(c *pangolin.Client) error {
+// finishLogin turns an approved login into a saved account. If the user
+// cancelled or logged out meanwhile, it discards the new session instead.
+func (s *server) finishLogin(flow *loginFlow, c *pangolin.Client) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	user, err := c.GetUser(ctx)
@@ -369,13 +431,14 @@ func (s *server) finishLogin(c *pangolin.Client) error {
 	}
 
 	s.mu.Lock()
-	prev := s.acct
+	prev := copyAccount(s.acct)
 	s.mu.Unlock()
+	same := prev != nil && prev.Server == c.Server && prev.UserID == user.UserID
 
 	// Reuse this profile's device when the same user logs in again, so the
 	// server does not collect stale devices.
 	var creds pangolin.OlmCredentials
-	if prev != nil && prev.Server == c.Server && prev.UserID == user.UserID && prev.Olm.ID != "" {
+	if same && prev.Olm.ID != "" {
 		exists, err := c.OlmExists(ctx, user.UserID, prev.Olm.ID)
 		if err != nil {
 			return err
@@ -401,7 +464,7 @@ func (s *server) finishLogin(c *pangolin.Client) error {
 	if user.Name != nil {
 		acct.Name = *user.Name
 	}
-	if prev != nil && prev.Server == c.Server && prev.UserID == user.UserID {
+	if same {
 		acct.ExitNodes = prev.ExitNodes
 		acct.OrgID = prev.OrgID
 	}
@@ -413,6 +476,15 @@ func (s *server) finishLogin(c *pangolin.Client) error {
 	}
 
 	s.mu.Lock()
+	if s.login != flow {
+		s.mu.Unlock()
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = c.Logout(ctx)
+		}()
+		return nil
+	}
 	defer s.mu.Unlock()
 	if err := s.store.save(acct); err != nil {
 		return fmt.Errorf("cannot save the login: %w", err)
@@ -420,6 +492,7 @@ func (s *server) finishLogin(c *pangolin.Client) error {
 	s.acct = acct
 	s.orgs = orgs
 	s.gateways = nil
+	s.exitRetryAt = time.Time{}
 	return nil
 }
 
@@ -432,40 +505,68 @@ func hasOrg(orgs []pangolin.Org, id string) bool {
 	return false
 }
 
-// sessionEnded keeps the server and email for the next login but forgets
-// the session.
-func (s *server) sessionEnded() {
+// sessionEnded forgets the session if it is still token, and stops the
+// tunnel. The server, user and device stay for the next login.
+func (s *server) sessionEnded(token string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.acct == nil {
+	if !s.sameSession(token) {
+		s.mu.Unlock()
 		return
 	}
 	s.acct.SessionToken = ""
 	if err := s.store.save(s.acct); err != nil {
 		log.Printf("save account: %v", err)
 	}
-	s.lastErr = "Your Pangolin session ended. Log in again."
+	s.lastErr = sessionEndedMessage
+	s.mu.Unlock()
+	go func() {
+		s.tun.stop()
+		s.pushState()
+	}()
 }
 
-func (s *server) logout() error {
+// onTunnelAuthError runs when olm's token request was refused. olm can
+// also see this for its own cached token, so the session is checked first.
+func (s *server) onTunnelAuthError() {
+	acct, err := s.loggedIn()
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_, err = s.client(&acct).GetUser(ctx)
+	if pangolin.IsStatus(err, http.StatusUnauthorized) {
+		s.sessionEnded(acct.SessionToken)
+	} else {
+		s.setError("The server refused the tunnel. Turn the connection off and on to try again.")
+	}
+	s.pushState()
+}
+
+// logout ends the session on the server and forgets it. The device
+// registration stays, so the next login of the same user reuses it.
+func (s *server) logout() {
 	s.cancelLogin()
 	s.tun.stop()
 	s.mu.Lock()
-	acct := s.acct
-	s.acct = nil
+	acct := copyAccount(s.acct)
+	if s.acct != nil {
+		s.acct.SessionToken = ""
+		if err := s.store.save(s.acct); err != nil {
+			log.Printf("save account: %v", err)
+		}
+	}
 	s.orgs = nil
 	s.gateways = nil
 	s.lastErr = ""
-	err := s.store.remove()
 	s.mu.Unlock()
 	if acct != nil && acct.SessionToken != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if logoutErr := s.client(acct).Logout(ctx); logoutErr != nil {
-			log.Printf("server logout: %v", logoutErr)
+		if err := s.client(acct).Logout(ctx); err != nil {
+			log.Printf("server logout: %v", err)
 		}
 		cancel()
 	}
-	return err
 }
 
 func (s *server) selectOrg(orgID string) error {
@@ -481,6 +582,7 @@ func (s *server) selectOrg(orgID string) error {
 	changed := s.acct.OrgID != orgID
 	s.acct.OrgID = orgID
 	s.gateways = nil
+	s.exitRetryAt = time.Time{}
 	s.lastErr = ""
 	err := s.store.save(s.acct)
 	s.mu.Unlock()
@@ -518,12 +620,15 @@ func (s *server) fetchGateways() (map[int]pangolin.Gateway, error) {
 	if err != nil {
 		return nil, err
 	}
+	if acct.OrgID == "" {
+		return nil, errors.New("choose an organisation first")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	list, err := s.client(&acct).ListGateways(ctx, acct.OrgID)
 	if err != nil {
 		if pangolin.IsStatus(err, http.StatusUnauthorized) {
-			s.sessionEnded()
+			s.sessionEnded(acct.SessionToken)
 		}
 		return nil, err
 	}
@@ -532,11 +637,30 @@ func (s *server) fetchGateways() (map[int]pangolin.Gateway, error) {
 		byID[g.SiteResourceID] = g
 	}
 	s.mu.Lock()
-	if s.acct != nil && s.acct.OrgID == acct.OrgID {
+	if s.sameSession(acct.SessionToken) && s.acct.OrgID == acct.OrgID {
 		s.gateways = byID
 	}
 	s.mu.Unlock()
 	return byID, nil
+}
+
+// gateway returns a gateway of the current org from the cache, or fetches
+// the list when it is not cached.
+func (s *server) gateway(id int) (pangolin.Gateway, error) {
+	s.mu.Lock()
+	gw, ok := s.gateways[id]
+	s.mu.Unlock()
+	if ok {
+		return gw, nil
+	}
+	byID, err := s.fetchGateways()
+	if err != nil {
+		return pangolin.Gateway{}, err
+	}
+	if gw, ok = byID[id]; !ok {
+		return pangolin.Gateway{}, errors.New("that exit node is not available")
+	}
+	return gw, nil
 }
 
 func (s *server) listExitNodes() (any, error) {
@@ -560,6 +684,8 @@ func (s *server) listExitNodes() (any, error) {
 	return out, nil
 }
 
+// setExitNode saves the exit-node choice of the current org. The reconcile
+// applies it to the tunnel.
 func (s *server) setExitNode(id int) error {
 	if id < 0 {
 		return errors.New("invalid exit node")
@@ -570,23 +696,13 @@ func (s *server) setExitNode(id int) error {
 	}
 	var gw pangolin.Gateway
 	if id != 0 {
-		s.mu.Lock()
-		cached, ok := s.gateways[id]
-		s.mu.Unlock()
-		if !ok {
-			byID, err := s.fetchGateways()
-			if err != nil {
-				return err
-			}
-			if cached, ok = byID[id]; !ok {
-				return errors.New("that exit node is not available")
-			}
+		if gw, err = s.gateway(id); err != nil {
+			return err
 		}
-		gw = cached
 	}
 
 	s.mu.Lock()
-	if s.acct == nil || s.acct.OrgID != acct.OrgID {
+	if !s.sameSession(acct.SessionToken) || s.acct.OrgID != acct.OrgID {
 		s.mu.Unlock()
 		return errors.New("the organisation changed, try again")
 	}
@@ -599,51 +715,80 @@ func (s *server) setExitNode(id int) error {
 		s.acct.ExitNodes[acct.OrgID] = exitNodeChoice{SiteResourceID: id, Name: gw.Name}
 	}
 	s.lastErr = ""
-	saveErr := s.store.save(s.acct)
+	s.exitRetryAt = time.Time{}
+	err = s.store.save(s.acct)
 	s.mu.Unlock()
-	if saveErr != nil {
-		return saveErr
+	if err != nil {
+		return err
 	}
-
-	if !s.tun.status().registered {
-		return nil // applied by onTunnelConnected
-	}
-	if id == 0 {
-		return s.tun.clearExitNode()
-	}
-	return s.tun.selectExitNode(gw.SiteResourceID, gw.SiteIDs)
+	s.reconcileExitNode()
+	return nil
 }
 
-// onTunnelConnected applies the saved exit node of the org.
-func (s *server) onTunnelConnected() {
+// After a failed apply, the reconcile waits this long before it tries again.
+const exitNodeRetry = 15 * time.Second
+
+// reconcileExitNode makes the tunnel's gateway match the saved choice. It
+// runs on every status tick, so it also repairs a gateway that the server
+// turned off, and applies the choice after every (re)connect.
+func (s *server) reconcileExitNode() {
+	if !s.reconcileMu.TryLock() {
+		return
+	}
+	defer s.reconcileMu.Unlock()
+
 	acct, err := s.loggedIn()
 	if err != nil {
 		return
 	}
-	id := acct.ExitNodes[acct.OrgID].SiteResourceID
-	if id == 0 {
+	gs := s.tun.gatewayState()
+	if !gs.registered {
 		return
 	}
-	s.mu.Lock()
-	gw, ok := s.gateways[id]
-	s.mu.Unlock()
-	if !ok {
-		byID, err := s.fetchGateways()
-		if err != nil {
-			s.setError("Cannot turn on the exit node: " + err.Error())
-			s.pushState()
-			return
+	want := acct.ExitNodes[acct.OrgID].SiteResourceID
+	if want == 0 {
+		if gs.active {
+			if err := s.tun.clearExitNode(); err != nil {
+				s.setError("Cannot turn off the exit node: " + err.Error())
+			}
 		}
-		if gw, ok = byID[id]; !ok {
-			s.setError("The saved exit node is no longer available.")
-			s.pushState()
-			return
-		}
+		return
 	}
-	if err := s.tun.selectExitNode(gw.SiteResourceID, gw.SiteIDs); err != nil {
+	if gs.active && gs.id == want {
+		return
+	}
+
+	s.mu.Lock()
+	wait := time.Now().Before(s.exitRetryAt)
+	s.mu.Unlock()
+	if wait {
+		return
+	}
+	err = s.applyExitNode(want, gs.trackedSites)
+	if err != nil {
+		s.mu.Lock()
+		s.exitRetryAt = time.Now().Add(exitNodeRetry)
+		s.mu.Unlock()
 		s.setError("Cannot turn on the exit node: " + err.Error())
 	}
-	s.pushState()
+}
+
+func (s *server) applyExitNode(id int, tracked map[int]bool) error {
+	gw, err := s.gateway(id)
+	if err != nil {
+		return err
+	}
+	// olm rejects the whole selection if one site is not a connected peer.
+	var siteIDs []int
+	for _, sid := range gw.SiteIDs {
+		if tracked[sid] {
+			siteIDs = append(siteIDs, sid)
+		}
+	}
+	if len(siteIDs) == 0 {
+		return errors.New("none of its sites is connected")
+	}
+	return s.tun.selectExitNode(gw.SiteResourceID, siteIDs)
 }
 
 func (s *server) state() stateView {
@@ -656,9 +801,6 @@ func (s *server) state() stateView {
 		Sites:  []siteState{},
 		Routes: routes{Hosts: []string{}, CIDRs: []string{}},
 		Error:  s.lastErr,
-	}
-	if s.orgs != nil {
-		v.Orgs = s.orgs
 	}
 	if s.acct != nil {
 		v.Server = s.acct.Server
@@ -681,14 +823,16 @@ func (s *server) state() stateView {
 		v.Phase = "connected"
 	}
 	if v.Phase == "loggedOut" || v.Phase == "loggingIn" {
-		v.Orgs = []pangolin.Org{}
 		return v
+	}
+	if s.orgs != nil {
+		v.Orgs = s.orgs
 	}
 	v.OrgID = s.acct.OrgID
 	if ts.running {
 		v.Sites = ts.sites
 		if v.Error == "" {
-			v.Error = ts.olmError
+			v.Error = sentence(ts.olmError)
 		}
 	}
 	if v.Phase == "connected" {
@@ -708,24 +852,23 @@ func (s *server) state() stateView {
 // pushState sends a state event when the state differs from the last one
 // sent.
 func (s *server) pushState() {
+	s.pushMu.Lock()
+	defer s.pushMu.Unlock()
 	if s.currentStore() == nil {
 		return
 	}
-	v := s.state()
-	b, err := json.Marshal(v)
+	b, err := json.Marshal(stateEvent{Event: "state", State: s.state()})
 	if err != nil {
 		return
 	}
 	s.mu.Lock()
 	same := bytes.Equal(b, s.lastSent)
-	if !same {
-		s.lastSent = b
-	}
+	s.lastSent = b
 	s.mu.Unlock()
 	if same {
 		return
 	}
-	if err := s.out.send(stateEvent{Event: "state", State: v}); err != nil {
+	if err := s.out.sendRaw(b); err != nil {
 		log.Printf("send state: %v", err)
 	}
 }

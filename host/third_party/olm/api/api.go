@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -712,20 +713,40 @@ func (s *API) handleMetadataChange(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// GetStatus returns a copy of the status that shares no maps, slices or
+// pointers with the API, so the caller can read it while olm updates it.
 func (s *API) GetStatus() StatusResponse {
+	s.statusMu.RLock()
+	defer s.statusMu.RUnlock()
+
+	peerStatuses := make(map[int]*PeerStatus, len(s.peerStatuses))
+	for id, ps := range s.peerStatuses {
+		c := *ps
+		peerStatuses[id] = &c
+	}
+	var olmError *OlmError
+	if s.olmError != nil {
+		c := *s.olmError
+		olmError = &c
+	}
+	var exitNodeStatus *ExitNodeStatus
+	if s.exitNodeStatus != nil {
+		c := *s.exitNodeStatus
+		exitNodeStatus = &c
+	}
 	return StatusResponse{
 		Connected:       s.isConnected,
 		Registered:      s.isRegistered,
 		Terminated:      s.isTerminated,
-		OlmError:        s.olmError,
+		OlmError:        olmError,
 		Version:         s.version,
 		Agent:           s.agent,
 		OrgID:           s.orgID,
-		PeerStatuses:    s.peerStatuses,
+		PeerStatuses:    peerStatuses,
 		NetworkSettings: network.GetSettings(),
-		ExitNodeStatus:  s.exitNodeStatus,
+		ExitNodeStatus:  exitNodeStatus,
 		GatewayActive:   s.gatewayActive,
-		GatewaySiteIds:  s.gatewaySiteIds,
+		GatewaySiteIds:  slices.Clone(s.gatewaySiteIds),
 
 		GatewaySiteResourceId: s.gatewaySiteResourceId,
 	}

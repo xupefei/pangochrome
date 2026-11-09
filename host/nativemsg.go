@@ -31,23 +31,42 @@ func readMessage(r io.Reader) ([]byte, error) {
 
 // msgWriter writes native-messaging frames. It is safe for concurrent use.
 type msgWriter struct {
-	mu sync.Mutex
-	w  io.Writer
+	mu     sync.Mutex
+	w      io.Writer
+	closed bool
 }
+
+var errWriterClosed = errors.New("the browser closed the connection")
 
 func (m *msgWriter) send(v any) error {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
+	return m.sendRaw(b)
+}
+
+// sendRaw writes one frame of already-encoded JSON.
+func (m *msgWriter) sendRaw(b []byte) error {
 	if len(b) > maxMessageSize {
 		return errors.New("message is over the 1 MiB limit")
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed {
+		return errWriterClosed
+	}
 	if err := binary.Write(m.w, binary.LittleEndian, uint32(len(b))); err != nil {
 		return err
 	}
-	_, err = m.w.Write(b)
+	_, err := m.w.Write(b)
 	return err
+}
+
+// close stops all later writes. After Chrome closes the port, a write to
+// stdout would raise SIGPIPE and end the process during teardown.
+func (m *msgWriter) close() {
+	m.mu.Lock()
+	m.closed = true
+	m.mu.Unlock()
 }

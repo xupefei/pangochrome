@@ -81,16 +81,17 @@ func (s accountStore) save(a *account) error {
 	if err != nil {
 		return err
 	}
+	// CreateTemp makes the file with mode 0600.
 	tmp, err := os.CreateTemp(filepath.Dir(s.path), ".account-*.json")
 	if err != nil {
 		return err
 	}
 	defer os.Remove(tmp.Name())
-	if err := tmp.Chmod(0o600); err != nil {
+	if _, err := tmp.Write(b); err != nil {
 		tmp.Close()
 		return err
 	}
-	if _, err := tmp.Write(b); err != nil {
+	if err := tmp.Sync(); err != nil {
 		tmp.Close()
 		return err
 	}

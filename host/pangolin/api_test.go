@@ -16,6 +16,7 @@ func TestNormalizeServer(t *testing.T) {
 		"app.pangolin.net":            "https://app.pangolin.net",
 		" https://p.example.com/ ":    "https://p.example.com",
 		"http://localhost:3000":       "http://localhost:3000",
+		"http://127.0.0.1:18080":      "http://127.0.0.1:18080",
 		"HTTPS://Mixed.Example.com":   "https://Mixed.Example.com",
 		"pangolin.example.com:8443//": "https://pangolin.example.com:8443",
 	}
@@ -25,7 +26,7 @@ func TestNormalizeServer(t *testing.T) {
 			t.Errorf("NormalizeServer(%q) = %q, %v; want %q", in, got, err, want)
 		}
 	}
-	for _, in := range []string{"", "ftp://x.example", "https://x.example/sub", "https://", "https://x.example/?q=1"} {
+	for _, in := range []string{"", "ftp://x.example", "https://x.example/sub", "https://", "https://x.example/?q=1", "http://p.example.com", "http://10.0.0.5"} {
 		if got, err := NormalizeServer(in); err == nil {
 			t.Errorf("NormalizeServer(%q) = %q, want error", in, got)
 		}
