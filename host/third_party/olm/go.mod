@@ -35,6 +35,7 @@ require (
 // To be used ONLY for local development
 // replace github.com/fosrl/newt => ../newt
 
-// newt with NativeConfigDisabled honoured on every platform, until that
-// change is in a newt release.
-replace github.com/fosrl/newt => github.com/xupefei/newt v0.0.0-20261109152647-b52ef9dbf45c
+// newt with two fixes, until they are in a newt release: NativeConfigDisabled
+// is honoured on every platform, and hole-punch test packets are not sent to
+// unroutable endpoints. Branch pangochrome of github.com/xupefei/newt.
+replace github.com/fosrl/newt => github.com/xupefei/newt v0.0.0-20261111124430-1c0716d079cd

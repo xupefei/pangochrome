@@ -15,12 +15,20 @@ Enable it with `OlmConfig.Netstack = true`. In netstack mode `StartTunnel`
 forces `NativeDNSManaged` on and `OverrideDNS`, `EnableUAPI` and
 `SubnetRouter` off, so a server push cannot change host DNS either.
 
-Host routes and addresses are left alone through newt's existing
-`network.NativeConfigDisabled` flag, which olm already sets when it is handed
-a TUN file descriptor. Upstream newt v1.19.0 honours that flag only on macOS,
-so `go.mod` (here and in `host/`) replaces newt with
-https://github.com/xupefei/newt/tree/native-config-disabled, which honours it
-on Linux and Windows too.
+`go.mod` (here and in `host/`) replaces newt v1.19.0 with
+https://github.com/xupefei/newt/tree/pangochrome, which adds two fixes. Each
+is also on its own branch for upstream:
+
+- `native-config-disabled`: host routes and addresses are left alone through
+  newt's existing `network.NativeConfigDisabled` flag, which olm already sets
+  when it is handed a TUN file descriptor. Upstream newt honours that flag
+  only on macOS; this branch honours it on Linux and Windows too.
+- `holepunch-skip-unroutable`: hole-punch test packets are not sent to
+  endpoints the host has no route to. Sites report every interface address as
+  a local endpoint, IPv6 included. On an IPv4-only network, with a macOS
+  content filter attached (endpoint security software uses one), each failed
+  IPv6 send was reported on the WireGuard socket's next send, usually a
+  handshake, and the tunnel never came up.
 
 ## Changes
 

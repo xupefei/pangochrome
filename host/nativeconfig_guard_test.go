@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/fosrl/newt/holepunch"
 	"github.com/fosrl/newt/network"
 )
 
@@ -146,3 +147,10 @@ func TestNewtHonoursNativeConfigDisabled(t *testing.T) {
 		t.Errorf("ConfigureInterface reached the OS with NativeConfigDisabled set: %v", err)
 	}
 }
+
+// The newt in use must not send hole-punch test packets to endpoints this
+// host cannot route to: on macOS with a content filter attached, such a send
+// fails a later WireGuard handshake. Upstream newt v1.19.0 has no
+// holepunch.ErrNoRoute, so this does not compile without the newt replace in
+// go.mod.
+var _ = holepunch.ErrNoRoute
