@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 )
 
 // These must match config/ids.json; install_test.go checks this.
@@ -18,7 +19,10 @@ const (
 	defaultExtensionID = "lioplghkjopgaienllcabfmfehgkjgfh"
 )
 
-var extensionIDPattern = regexp.MustCompile(`^[a-p]{32}$`)
+var (
+	extensionIDPattern = regexp.MustCompile(`^[a-p]{32}$`)
+	originPattern      = regexp.MustCompile(`^chrome-extension://[a-p]{32}/$`)
+)
 
 type hostManifest struct {
 	Name           string   `json:"name"`
@@ -41,9 +45,15 @@ func browserDirs(goos, home, configHome string) []browserDir {
 		base := filepath.Join(home, "Library", "Application Support")
 		return []browserDir{
 			{"Google Chrome", filepath.Join(base, "Google", "Chrome")},
+			{"Google Chrome Beta", filepath.Join(base, "Google", "Chrome Beta")},
+			{"Google Chrome Dev", filepath.Join(base, "Google", "Chrome Dev")},
+			{"Google Chrome Canary", filepath.Join(base, "Google", "Chrome Canary")},
 			{"Chromium", filepath.Join(base, "Chromium")},
 			{"Brave", filepath.Join(base, "BraveSoftware", "Brave-Browser")},
 			{"Microsoft Edge", filepath.Join(base, "Microsoft Edge")},
+			{"Vivaldi", filepath.Join(base, "Vivaldi")},
+			{"Opera", filepath.Join(base, "com.operasoftware.Opera")},
+			{"Arc", filepath.Join(base, "Arc", "User Data")},
 		}
 	case "linux":
 		if configHome == "" {
@@ -51,9 +61,13 @@ func browserDirs(goos, home, configHome string) []browserDir {
 		}
 		return []browserDir{
 			{"Google Chrome", filepath.Join(configHome, "google-chrome")},
+			{"Google Chrome Beta", filepath.Join(configHome, "google-chrome-beta")},
+			{"Google Chrome Dev", filepath.Join(configHome, "google-chrome-unstable")},
 			{"Chromium", filepath.Join(configHome, "chromium")},
 			{"Brave", filepath.Join(configHome, "BraveSoftware", "Brave-Browser")},
 			{"Microsoft Edge", filepath.Join(configHome, "microsoft-edge")},
+			{"Vivaldi", filepath.Join(configHome, "vivaldi")},
+			{"Opera", filepath.Join(configHome, "opera")},
 		}
 	}
 	return nil
@@ -146,23 +160,14 @@ func resolveBinaryPath(p string) (string, error) {
 }
 
 // install writes the manifest for Chrome always, and for each other browser
-// whose data directory exists.
+// whose data directory exists. It keeps the extension IDs that an earlier
+// install allowed, so that a store build and an unpacked build can share
+// one helper.
 func install(dirs []browserDir, binaryPath, extensionID string) ([]string, error) {
 	if !extensionIDPattern.MatchString(extensionID) {
 		return nil, fmt.Errorf("%q is not a Chrome extension ID", extensionID)
 	}
-	m := hostManifest{
-		Name:           nativeHostName,
-		Description:    "Pangochrome helper",
-		Path:           binaryPath,
-		Type:           "stdio",
-		AllowedOrigins: []string{"chrome-extension://" + extensionID + "/"},
-	}
-	b, err := json.MarshalIndent(m, "", "  ")
-	if err != nil {
-		return nil, err
-	}
-	b = append(b, '\n')
+	origin := "chrome-extension://" + extensionID + "/"
 
 	var written []string
 	for i, d := range dirs {
@@ -172,15 +177,48 @@ func install(dirs []browserDir, binaryPath, extensionID string) ([]string, error
 			}
 		}
 		p := manifestPath(d.root)
+		m := hostManifest{
+			Name:           nativeHostName,
+			Description:    "Pangochrome helper",
+			Path:           binaryPath,
+			Type:           "stdio",
+			AllowedOrigins: append(previousOrigins(p), origin),
+		}
+		slices.Sort(m.AllowedOrigins)
+		m.AllowedOrigins = slices.Compact(m.AllowedOrigins)
+		b, err := json.MarshalIndent(m, "", "  ")
+		if err != nil {
+			return written, err
+		}
 		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 			return written, fmt.Errorf("%s: %w", d.browser, err)
 		}
-		if err := os.WriteFile(p, b, 0o644); err != nil {
+		if err := os.WriteFile(p, append(b, '\n'), 0o644); err != nil {
 			return written, fmt.Errorf("%s: %w", d.browser, err)
 		}
 		written = append(written, p)
 	}
 	return written, nil
+}
+
+// previousOrigins returns the valid extension origins of our manifest at p,
+// or nothing if p is missing or is not ours.
+func previousOrigins(p string) []string {
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return nil
+	}
+	var m hostManifest
+	if json.Unmarshal(b, &m) != nil || m.Name != nativeHostName {
+		return nil
+	}
+	var out []string
+	for _, o := range m.AllowedOrigins {
+		if originPattern.MatchString(o) {
+			out = append(out, o)
+		}
+	}
+	return out
 }
 
 // uninstall removes only manifests that carry our host name.

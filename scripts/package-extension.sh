@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Writes the Chrome Web Store zip from extension/dist. The zip has no manifest
+# Writes the Chrome Web Store zip from extension/dist, without the manifest
 # "key": the store keeps the key and the extension ID itself.
 set -euo pipefail
 
@@ -8,7 +8,9 @@ set -euo pipefail
   exit 2
 }
 repo=$(cd "$(dirname "$0")/.." && pwd)
-out=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
+mkdir -p "$(dirname "$1")"
+out_dir=$(cd "$(dirname "$1")" && pwd)
+out=$out_dir/$(basename "$1")
 [ -f "$repo/extension/dist/manifest.json" ] || {
   echo "package-extension.sh: build the extension first (make extension)" >&2
   exit 1

@@ -26,7 +26,7 @@ const usage = `pangochrome-helper is started by the Pangochrome extension.
 
 Commands:
   pangochrome-helper install [--extension-id ID] [--binary-path PATH]
-      Register the helper with Chrome, Chromium, Brave and Edge for this user.
+      Register the helper with this user's Chromium browsers.
   pangochrome-helper uninstall
       Remove the registrations that install wrote.
   pangochrome-helper version

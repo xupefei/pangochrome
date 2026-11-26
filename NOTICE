@@ -4,8 +4,8 @@ Pangochrome is licensed under the GNU Affero General Public License v3.0
 The helper includes olm (https://github.com/fosrl/olm) and newt
 (https://github.com/fosrl/newt), Copyright Fossorial, Inc., licensed under
 the GNU Affero General Public License v3.0. It builds them from the upstream
-releases named in patches/upstream.txt, with the changes in patches/olm.patch
-and patches/newt.patch, described in patches/README.md.
+releases in patches/upstream.txt. patches/olm.patch and patches/newt.patch
+hold the changes, and patches/README.md describes them.
 
 extension/src/native.ts and extension/src/proxy-auth.ts contain code adapted
 from tailchrome (https://github.com/dantraynor/tailchrome), used under this

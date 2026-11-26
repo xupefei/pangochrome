@@ -1,23 +1,31 @@
 name: Release
 
-# Push a tag vX.Y.Z that equals the extension version to publish a release
-# with the helpers, install.sh, the Chrome Web Store zip and SHA256SUMS.txt.
+# See "Release" in README.md.
 on:
   push:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
+  # Runs the repo's code and its npm dependencies, so it gets no write token.
+  build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@v6
         with:
           go-version-file: host/go.mod
-          cache-dependency-path: host/go.sum
+          cache-dependency-path: |
+            host/go.sum
+            patches/upstream.txt
       - uses: actions/setup-node@v5
         with:
           node-version: 22
@@ -25,22 +33,42 @@ jobs:
           cache-dependency-path: extension/package-lock.json
       - name: Check that the tag equals the extension version
         run: |
-          version=$(node -p 'require("./extension/static/manifest.json").version')
-          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME does not equal the extension version $version."
-            exit 1
-          fi
-      - run: npm ci
-        working-directory: extension
+          for f in extension/static/manifest.json extension/package.json; do
+            v=$(node -p "require('./$f').version")
+            if [ "$GITHUB_REF_NAME" != "v$v" ]; then
+              echo "::error::Tag $GITHUB_REF_NAME does not equal version $v in $f."
+              exit 1
+            fi
+          done
       - run: make test
       - run: make release VERSION="$GITHUB_REF_NAME"
+      - uses: actions/attest@v4
+        with:
+          subject-path: dist/*
+      - uses: actions/upload-artifact@v6
+        with:
+          name: release
+          path: dist/
+          if-no-files-found: error
+
+  # Runs no code from the repo.
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          name: release
+          path: dist
       - name: Publish the release
+        working-directory: dist
         env:
           GH_TOKEN: ${{ github.token }}
-        working-directory: dist
+          GH_REPO: ${{ github.repository }}
         run: |
+          sha256sum -c SHA256SUMS.txt
           gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes \
             --title "Pangochrome $GITHUB_REF_NAME" \
-            pangochrome-helper-linux-amd64 pangochrome-helper-linux-arm64 \
-            pangochrome-helper-darwin-amd64 pangochrome-helper-darwin-arm64 \
-            "pangochrome-extension-$GITHUB_REF_NAME.zip" install.sh SHA256SUMS.txt
+            $(awk '{ print $2 }' SHA256SUMS.txt) SHA256SUMS.txt

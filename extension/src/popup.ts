@@ -6,7 +6,7 @@ import type {
   Snapshot,
 } from "./messages";
 import type { ExitNode, LoginInfo, Site, State } from "./protocol";
-import { helperRunsOn, installCommand } from "./install";
+import { helperRunsOn, helperUpdateNeeded, installCommand, type PlatformOs } from "./install";
 import { isHttpUrl, isPlainHostname } from "./url";
 
 const CLOUD_SERVER = "https://app.pangolin.net";
@@ -44,17 +44,21 @@ let lastRenderKey = "";
 const busy = new Set<string>();
 /** The value that the connect toggle shows while its request is in flight. */
 let pendingToggle: boolean | null = null;
-/** chrome.runtime.PlatformInfo os, once known. */
-let platformOs: string | null = null;
+let platformOs: PlatformOs | null = null;
+/** Set when the OS lookup fails. The install view then assumes a supported system. */
+let platformFailed = false;
 
 connect();
 render(true);
 chrome.runtime.getPlatformInfo().then(
   (info) => {
     platformOs = info.os;
-    render(true);
+    render();
   },
-  () => undefined,
+  () => {
+    platformFailed = true;
+    render();
+  },
 );
 
 function connect(): void {
@@ -155,7 +159,16 @@ async function loadExitNodes(orgKey: string): Promise<void> {
 }
 
 function render(force = false): void {
-  const key = JSON.stringify([snapshot, exitNodes, localError, loginChoice, pendingToggle, [...busy]]);
+  const key = JSON.stringify([
+    snapshot,
+    exitNodes,
+    localError,
+    loginChoice,
+    pendingToggle,
+    [...busy],
+    platformOs,
+    platformFailed,
+  ]);
   if (!force && key === lastRenderKey) return;
   lastRenderKey = key;
   const focused = document.activeElement;
@@ -169,7 +182,9 @@ function render(force = false): void {
 function buildView(): HTMLElement {
   if (!snapshot) return statusView("Loading...");
   const { helper, state } = snapshot;
-  if (helper.kind === "notInstalled" || helper.kind === "failed") return helperView(helper);
+  if (helper.kind === "notInstalled" || helper.kind === "notAllowed" || helper.kind === "failed") {
+    return helperView(helper);
+  }
   if (helper.kind !== "ready" || state === null) {
     return statusView("Starting the helper...");
   }
@@ -192,7 +207,15 @@ function statusView(text: string): HTMLElement {
 function helperView(helper: HelperStatus): HTMLElement {
   const view = section();
   if (helper.kind === "notInstalled") {
-    view.append(heading("Helper required"), ...installParts());
+    view.append(
+      heading("Helper required"),
+      ...installParts("Pangochrome needs its helper to reach private sites. Run this command in a terminal, then press Retry."),
+    );
+  } else if (helper.kind === "notAllowed") {
+    view.append(
+      heading("Helper allows another extension"),
+      ...installParts("Run this command to allow this extension, then press Retry."),
+    );
   } else if (helper.kind === "failed") {
     view.append(
       heading("Helper not running"),
@@ -300,6 +323,7 @@ function openApprovalPage(login: LoginInfo): void {
 function mainView(state: State, snap: Snapshot): HTMLElement {
   const view = section();
   view.append(header(state, snap));
+  view.append(...updateNoticeParts(snap));
   view.append(...blockedParts("helper"));
   if (snap.wantConnected && state.phase === "disconnected") {
     const reconnect = button("Reconnect", "btn btn-primary", () => act("reconnect", { action: "reconnect" }), {
@@ -560,19 +584,46 @@ function footer(state: State): HTMLElement {
   return footerEl;
 }
 
-function installParts(): HTMLElement[] {
-  if (platformOs === null) return [];
-  if (!helperRunsOn(platformOs)) {
+/**
+ * Whether the helper runs on this system. Null while the OS is unknown. After a
+ * failed lookup it is assumed to be true.
+ */
+function helperSupported(): boolean | null {
+  if (platformOs !== null) return helperRunsOn(platformOs);
+  return platformFailed ? true : null;
+}
+
+function installParts(text: string): HTMLElement[] {
+  const supported = helperSupported();
+  if (supported === null) return [];
+  if (!supported) {
     return [el("p", "muted", "The Pangochrome helper runs on macOS and Linux only.")];
   }
   const command = installCommand(chrome.runtime.getManifest().version, chrome.runtime.id);
   if (command === null) {
     return [el("p", "muted", "This build of Pangochrome has no matching helper release.")];
   }
-  return [
-    el("p", "muted", "Pangochrome needs its helper to reach private sites. Run this command in a terminal, then press Retry."),
+  return [el("p", "muted", text), commandRow(command)];
+}
+
+/** A non-blocking notice when the helper is on another release than this extension. */
+function updateNoticeParts(snap: Snapshot): HTMLElement[] {
+  const helperVersion = snap.helperVersion;
+  const extensionVersion = chrome.runtime.getManifest().version;
+  if (helperVersion === null || !helperUpdateNeeded(helperVersion, extensionVersion)) return [];
+  if (helperSupported() !== true) return [];
+  const command = installCommand(extensionVersion, chrome.runtime.id);
+  if (command === null) return [];
+  const notice = el("section", "notice");
+  notice.append(
+    el(
+      "p",
+      "",
+      `The helper is ${helperVersion}. This extension is v${extensionVersion}. Run this command to update the helper:`,
+    ),
     commandRow(command),
-  ];
+  );
+  return [notice];
 }
 
 function commandRow(command: string): HTMLElement {

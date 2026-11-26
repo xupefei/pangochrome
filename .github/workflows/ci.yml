@@ -13,19 +13,33 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@v6
         with:
           go-version-file: host/go.mod
-          cache-dependency-path: host/go.sum
+          cache-dependency-path: |
+            host/go.sum
+            patches/upstream.txt
       - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: extension/package-lock.json
-      - run: npm ci
-        working-directory: extension
       - run: make test
+      - name: Check that the patches regenerate unchanged
+        run: make patches && git diff --exit-code patches/
+      - name: Check netns mode in a network namespace
+        if: runner.os == 'Linux'
+        run: |
+          # Ubuntu 24.04 blocks unprivileged user namespaces through AppArmor.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          make test-netns
+      - name: Build the release files
+        run: make release VERSION=v0.0.0
+      - name: Run the helper built for this runner
+        run: ./dist/pangochrome-helper-$(go env GOOS)-$(go env GOARCH) version

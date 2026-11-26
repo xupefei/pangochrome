@@ -6,7 +6,7 @@ import type {
   PopupToBackground,
   Snapshot,
 } from "./messages";
-import { NativeClient, type NativeEvent } from "./native";
+import { NativeClient, type HelperFailure, type NativeEvent } from "./native";
 import {
   isExitNodeList,
   isHello,
@@ -81,6 +81,7 @@ class Background {
   private profileId = "";
   private loaded = false;
   private proxyPort: number | null = null;
+  private helperVersion: string | null = null;
   /** Counts helper open and close events. Replies from an older session are ignored. */
   private session = 0;
   private helloGate: Gate = failedGate(NOT_RUNNING);
@@ -167,6 +168,7 @@ class Background {
       case "open":
         this.session += 1;
         this.helper = { kind: "starting" };
+        this.helperVersion = null;
         this.state = null;
         this.proxyPort = null;
         this.connectError = null;
@@ -183,10 +185,8 @@ class Background {
         this.proxyPort = null;
         this.state = null;
         this.clearRetryTimer();
-        this.helper =
-          event.failure.kind === "notInstalled"
-            ? { kind: "notInstalled" }
-            : { kind: "failed", message: event.failure.message };
+        this.helper = helperStatusFor(event.failure);
+        this.helperVersion = null;
         void this.scheduleRouting();
         break;
       case "state":
@@ -206,6 +206,7 @@ class Background {
       const { port, username, password } = hello.proxy;
       this.auth.set({ port, username, password });
       this.proxyPort = port;
+      this.helperVersion = hello.version;
       this.helper = { kind: "ready" };
       gate.open();
       this.reconcile();
@@ -371,6 +372,7 @@ class Background {
   private publish(): void {
     const snapshot: Snapshot = {
       helper: this.helper,
+      helperVersion: this.helperVersion,
       wantConnected: this.wantConnected,
       state: this.state,
       mode: this.applied?.mode ?? null,
@@ -498,6 +500,17 @@ class Background {
       if (describeError(err) !== NOT_RUNNING) throw err;
     }
     return {};
+  }
+}
+
+function helperStatusFor(failure: HelperFailure): HelperStatus {
+  switch (failure.kind) {
+    case "notInstalled":
+      return { kind: "notInstalled" };
+    case "notAllowed":
+      return { kind: "notAllowed" };
+    case "failed":
+      return { kind: "failed", message: failure.message };
   }
 }
 

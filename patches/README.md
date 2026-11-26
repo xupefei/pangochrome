@@ -2,7 +2,7 @@
 
 The helper builds against pinned upstream releases of
 [olm](https://github.com/fosrl/olm) and [newt](https://github.com/fosrl/newt),
-with one patch each. Both projects are licensed under AGPL-3.0.
+with one patch each.
 
 - `upstream.txt`: the module, version and go.sum hash of each upstream release.
 - `olm.patch`, `newt.patch`: our changes, as `git diff` output against those releases.
@@ -18,8 +18,11 @@ replaces both modules with those directories. Git ignores them.
 2. Edit the files in `host/third_party/olm` or `host/third_party/newt`.
 3. Run `make patches` to write the edits to `olm.patch` and `newt.patch`.
 
-`make prepare` refuses to overwrite a tree that has edits that are not in its
-patch yet. `bash scripts/upstream.sh prepare --force` drops those edits.
+While `upstream.txt` and the patches stay the same, `make prepare` keeps a tree
+with edits, and the build uses them. When they change, `make prepare` stops
+before it replaces a tree with edits, and `make patches` refuses to write a
+patch for a tree built from other inputs. `bash scripts/upstream.sh prepare
+--force` drops the edits.
 
 ## olm (v1.10.2)
 
@@ -85,12 +88,14 @@ https://github.com/xupefei/newt, for upstream:
 ## Move to a new upstream release
 
 1. Set the new version in `upstream.txt`. Get its hash from the `Sum` field of
-   `go mod download -json github.com/fosrl/olm@<version>`.
+   `go mod download -json <module>@<version>`.
 2. Run `make prepare`. If the patch still applies, go to step 4.
-3. If it does not apply: move the patch aside, run `make prepare` to build the
-   bare release, apply the old patch in `host/third_party/<name>` with
-   `git apply --reject <old patch>`, resolve the `.rej` files, delete them and
-   run `make patches`.
+3. If it does not apply:
+   1. Move the patch out of `patches/`.
+   2. Run `make prepare`. It builds the release without the patch.
+   3. In `host/third_party/<name>`, run `git apply --reject <old patch>`.
+   4. Resolve the `.rej` files, then delete them.
+   5. Run `make patches`.
 4. Run `make test`. `TestOlmUsesOnlyReviewedNetworkSymbols` fails if olm
    starts using a `newt/network` symbol nobody has checked for netstack mode,
    or stops setting `NativeConfigDisabled` there.

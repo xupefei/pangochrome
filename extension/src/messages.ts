@@ -7,10 +7,13 @@ export type HelperStatus =
   | { kind: "starting" }
   | { kind: "ready" }
   | { kind: "notInstalled" }
+  | { kind: "notAllowed" }
   | { kind: "failed"; message: string };
 
 export interface Snapshot {
   helper: HelperStatus;
+  /** The helper version from its hello reply. Null until the helper answers hello. */
+  helperVersion: string | null;
   wantConnected: boolean;
   state: State | null;
   /** The routing mode in effect, or null when the last proxy write failed or none was made. */

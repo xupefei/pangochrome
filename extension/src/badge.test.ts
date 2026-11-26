@@ -10,8 +10,11 @@ function stateIn(phase: Phase, extra: Partial<State> = {}): State {
 }
 
 describe("badgeFor", () => {
-  it("shows an error when the helper is missing or failed", () => {
+  it("shows an error when the helper is missing, not allowed or failed", () => {
     expect(badgeFor({ helper: { kind: "notInstalled" }, state: null, error: null, mode: null }).text).toBe("!");
+    expect(badgeFor({ helper: { kind: "notAllowed" }, state: null, error: null, mode: "failClosed" }).text).toBe(
+      "!",
+    );
     expect(
       badgeFor({ helper: { kind: "failed", message: "x" }, state: null, error: null, mode: "failClosed" }).text,
     ).toBe("!");

@@ -8,7 +8,7 @@ Only the browser profile that runs the extension uses the tunnel. Other apps
 and other profiles keep the normal network.
 
 Pangochrome is tested on macOS. The Linux helper is built and unit-tested,
-but nobody has tried it in a real Linux desktop yet. Windows is not supported.
+but nobody has tried it on a real Linux desktop yet. Windows is not supported.
 
 ## Install
 
@@ -16,15 +16,28 @@ but nobody has tried it in a real Linux desktop yet. Windows is not supported.
 2. Open its popup. It shows a command for your system, for example:
 
    ```sh
-   curl -fsSL https://github.com/xupefei/pangochrome/releases/download/v0.1.0/install.sh | sh -s -- --version v0.1.0 --extension-id <id>
+   curl -fsSL https://github.com/xupefei/pangochrome/releases/download/v0.1.0/install.sh | sh -s -- --extension-id <id>
    ```
 
 3. Run the command in a terminal, then press **Retry** in the popup.
 
-The script downloads the helper of that release, checks it against the
-release's `SHA256SUMS.txt`, installs it as `~/.local/bin/pangochrome-helper`
-and registers it with Chrome, Chromium, Brave and Microsoft Edge. It needs no
-root. To remove the helper, run the same command with `--uninstall`.
+The script needs `curl`. It installs the helper of its own release:
+
+1. It downloads the helper for your system and checks it against the
+   release's `SHA256SUMS.txt`.
+2. It installs the helper as `~/.local/bin/pangochrome-helper`. It needs no
+   root.
+3. It registers the helper with the Chromium browsers that you have: Google
+   Chrome (also Beta, Dev and Canary), Chromium, Brave, Microsoft Edge,
+   Vivaldi, Opera and, on macOS, Arc. Snap and Flatpak browsers cannot start
+   the helper.
+
+When the extension updates to a newer version than the helper, the popup
+shows the command again. To remove the helper, run:
+
+```sh
+curl -fsSL https://github.com/xupefei/pangochrome/releases/latest/download/install.sh | sh -s -- --uninstall
+```
 
 ## How it works
 
@@ -35,12 +48,11 @@ Pangochrome has two parts:
   to the helper.
 - **The helper** (`host/`, Go) is a Chrome native-messaging host. It runs
   Pangolin's client library [olm](https://github.com/fosrl/olm) on a userspace
-  network stack, and serves an HTTP proxy on `127.0.0.1` that only the
-  extension can use.
+  network stack (netstack mode), and serves an HTTP proxy on `127.0.0.1` that
+  only the extension can use.
 
-The helper builds against pinned upstream releases of olm and newt, with a
-patch each in `patches/`. The olm patch adds the userspace mode. The newt
-patch has two fixes that mode needs. See `patches/README.md`.
+The olm and newt code comes from pinned upstream releases plus the patches in
+`patches/`. See `patches/README.md`.
 `docs/PROTOCOL.md` defines the messages between the two parts and the
 routing rules.
 
@@ -60,7 +72,8 @@ connection in the popup to browse normally.
 
 ## Build
 
-You need Go 1.26 or later and Node.js 22 or later.
+You need Go 1.26 or later, Node.js 22 or later, git and unzip. The tests
+also need Python 3.
 
 ```sh
 make helper        # writes dist/pangochrome-helper
@@ -68,17 +81,15 @@ make extension     # writes extension/dist
 make install-helper
 ```
 
-`make helper` first runs `make prepare`, which builds `host/third_party` from
-the pinned upstream releases and `patches/`.
-
-`make install-helper` registers `dist/pangochrome-helper` with Chrome,
-Chromium, Brave and Microsoft Edge for the current user, on Linux and macOS.
+`make install-helper` registers `dist/pangochrome-helper` with the Chromium
+browsers of the current user, on Linux and macOS.
 If you move the binary, run `pangochrome-helper install` again.
 
 Then open `chrome://extensions`, turn on Developer mode, click
-**Load unpacked** and select `extension/dist`. The extension ID is
-`lioplghkjopgaienllcabfmfehgkjgfh`. The helper accepts only this ID. To allow
-another ID, run `pangochrome-helper install --extension-id <id>`.
+**Load unpacked** and select `extension/dist`. The unpacked extension has the
+ID `lioplghkjopgaienllcabfmfehgkjgfh`, which `pangochrome-helper install`
+allows. To also allow another ID, such as the Chrome Web Store build's, run
+`pangochrome-helper install --extension-id <id>`.
 
 ## Use
 
@@ -89,11 +100,8 @@ another ID, run `pangochrome-helper install --extension-id <id>`.
 4. Choose the organisation and turn on the toggle.
 5. Optional: choose an exit node to send all browser traffic through a site.
 
-The helper keeps its state in `~/.config/pangochrome` on Linux and in
-`~/Library/Application Support/pangochrome` on macOS. Each browser profile
-has its own device and login. Logging out ends the session but keeps the
-device registration, so the next login reuses it. The log is `helper.log` in
-the same directory.
+Each browser profile has its own device and login. `docs/PRIVACY.md` lists
+what the helper keeps, and where.
 
 ## Test
 
@@ -101,9 +109,9 @@ the same directory.
 make test
 ```
 
-This runs the helper's Go tests, the upstream olm and newt tests for the
-patched packages, the extension's unit tests, and a test of `install.sh`
-against a local copy of a release. CI runs it on Linux and macOS.
+`make test` runs every test suite. CI runs it on Linux (x86-64 and arm64)
+and macOS. On Linux, CI also runs `make test-netns`, which checks in a
+network namespace that the helper leaves host routes and addresses alone.
 
 ## Release
 
@@ -112,16 +120,18 @@ against a local copy of a release. CI runs it on Linux and macOS.
 2. Push a tag `v<version>`, for example `v0.1.0`.
 
 The Release workflow runs the tests and publishes a GitHub release with the
-four helpers (`pangochrome-helper-{linux,darwin}-{amd64,arm64}`),
-`install.sh`, `pangochrome-extension-v<version>.zip` for the Chrome Web Store
-and `SHA256SUMS.txt`. The popup of extension version X installs the helper of
-release vX, so publish the release before you submit the zip to the store.
+helpers for macOS and Linux, `install.sh`, the Chrome Web Store zip
+`pangochrome-extension-v<version>.zip` and `SHA256SUMS.txt`, with a build
+attestation for each file. The popup of extension version X installs the
+helper of release vX, so submit only the zip of a published release.
+
+To check a download, run `gh attestation verify <file> --repo xupefei/pangochrome`.
 
 ## Limits
 
-- Chrome only. The helper runs on macOS and Linux. The helpers are not signed
-  with an Apple Developer ID. The install script works without one, because
-  macOS does not quarantine files that `curl` downloads.
+- Chromium browsers only. The helper runs on macOS and Linux. It is not
+  signed with an Apple Developer ID. The install script works without one,
+  because macOS does not quarantine files that `curl` downloads.
 - The tunnel carries IPv4 TCP only. Chrome does not use QUIC through a
   proxy, so HTTP/3 sites use TCP instead.
 - A host name that resolves to a resource IP in public DNS goes direct. Use

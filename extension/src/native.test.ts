@@ -321,11 +321,19 @@ describe("classifyDisconnect", () => {
     ["Specified native messaging host not found.", "notInstalled"],
     ["Native messaging host pangochrome.helper not found.", "notInstalled"],
     ["No such native application pangochrome.helper", "notInstalled"],
-    ["Access to the specified native messaging host is forbidden.", "failed"],
+    ["Access to the specified native messaging host is forbidden.", "notAllowed"],
+    ["Native messaging host pangochrome.helper is not allowed.", "notAllowed"],
     ["Native host has exited.", "failed"],
     ["", "failed"],
   ])("classifies %j as %s", (lastError, kind) => {
     expect(classifyDisconnect(lastError).kind).toBe(kind);
+  });
+
+  it("reports a forbidden host as notAllowed, not as a failure to retry", () => {
+    expect(classifyDisconnect("Access to the specified native messaging host is forbidden.")).toEqual({
+      kind: "notAllowed",
+      message: "The helper does not allow this extension.",
+    });
   });
 
   it("keeps Chrome's message for a failure", () => {

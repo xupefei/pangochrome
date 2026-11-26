@@ -139,7 +139,7 @@ export function isExitNodeList(value: unknown): value is ExitNode[] {
 }
 
 export function isHello(value: unknown): value is Hello {
-  if (!isRecord(value)) return false;
+  if (!isRecord(value) || !isString(value["version"])) return false;
   const proxy = value["proxy"];
   if (!isRecord(proxy)) return false;
   const port = proxy["port"];

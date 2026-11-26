@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -24,16 +25,32 @@ func TestIDsMatchConfig(t *testing.T) {
 	}
 }
 
+// dirOf returns the data directory of browser in dirs.
+func dirOf(t *testing.T, dirs []browserDir, browser string) string {
+	t.Helper()
+	for _, d := range dirs {
+		if d.browser == browser {
+			return d.root
+		}
+	}
+	t.Fatalf("no %s in %v", browser, dirs)
+	return ""
+}
+
 func TestBrowserDirs(t *testing.T) {
 	linux := browserDirs("linux", "/home/u", "")
-	if linux[0].root != "/home/u/.config/google-chrome" {
-		t.Errorf("linux Chrome root = %q", linux[0].root)
+	if linux[0].browser != "Google Chrome" || linux[0].root != "/home/u/.config/google-chrome" {
+		t.Errorf("linux first entry = %+v, want Google Chrome", linux[0])
 	}
-	if got := browserDirs("linux", "/home/u", "/xdg")[1].root; got != "/xdg/chromium" {
+	if got := dirOf(t, browserDirs("linux", "/home/u", "/xdg"), "Chromium"); got != "/xdg/chromium" {
 		t.Errorf("XDG Chromium root = %q", got)
 	}
-	if got := browserDirs("darwin", "/Users/u", "")[0].root; got != "/Users/u/Library/Application Support/Google/Chrome" {
-		t.Errorf("macOS Chrome root = %q", got)
+	mac := browserDirs("darwin", "/Users/u", "")
+	if mac[0].browser != "Google Chrome" || mac[0].root != "/Users/u/Library/Application Support/Google/Chrome" {
+		t.Errorf("macOS first entry = %+v, want Google Chrome", mac[0])
+	}
+	if got := dirOf(t, mac, "Arc"); got != "/Users/u/Library/Application Support/Arc/User Data" {
+		t.Errorf("macOS Arc root = %q", got)
 	}
 	if browserDirs("windows", "C:/", "") != nil {
 		t.Error("windows should be unsupported")
@@ -43,8 +60,8 @@ func TestBrowserDirs(t *testing.T) {
 func TestInstallAndUninstall(t *testing.T) {
 	tmp := t.TempDir()
 	dirs := browserDirs("linux", tmp, "")
-	// Chromium is present; Brave and Edge are not.
-	if err := os.MkdirAll(dirs[1].root, 0o755); err != nil {
+	// Chromium is present. The other browsers apart from Chrome are not.
+	if err := os.MkdirAll(dirOf(t, dirs, "Chromium"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -72,7 +89,7 @@ func TestInstallAndUninstall(t *testing.T) {
 	}
 
 	// A file with our name but another host inside is not ours to delete.
-	foreign := manifestPath(dirs[2].root)
+	foreign := manifestPath(dirOf(t, dirs, "Brave"))
 	if err := os.MkdirAll(filepath.Dir(foreign), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -110,5 +127,37 @@ func TestResolveBinaryPath(t *testing.T) {
 	}
 	if got, err := resolveBinaryPath(exe); err != nil || got != exe {
 		t.Errorf("resolveBinaryPath(exe) = %q, %v", got, err)
+	}
+}
+
+func TestInstallKeepsEarlierExtensionIDs(t *testing.T) {
+	dirs := browserDirs("linux", t.TempDir(), "")[:1]
+	const other = "abcdefghijklmnopabcdefghijklmnop"
+	for _, id := range []string{other, defaultExtensionID, defaultExtensionID} {
+		if _, err := install(dirs, "/opt/p/pangochrome-helper", id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b, err := os.ReadFile(manifestPath(dirs[0].root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m hostManifest
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"chrome-extension://" + other + "/", "chrome-extension://" + defaultExtensionID + "/"}
+	if !slices.Equal(m.AllowedOrigins, want) {
+		t.Fatalf("allowed_origins = %v, want %v", m.AllowedOrigins, want)
+	}
+
+	// Origins that are not extension origins are dropped.
+	m.AllowedOrigins = append(m.AllowedOrigins, "https://evil.example/")
+	b, _ = json.Marshal(m)
+	if err := os.WriteFile(manifestPath(dirs[0].root), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := previousOrigins(manifestPath(dirs[0].root)); !slices.Equal(got, want) {
+		t.Fatalf("previousOrigins = %v, want %v", got, want)
 	}
 }

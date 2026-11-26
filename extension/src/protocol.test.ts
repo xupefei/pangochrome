@@ -62,6 +62,11 @@ describe("isHello", () => {
     expect(isHello({ version: "0.1.0", proxy })).toBe(true);
   });
 
+  it("rejects a reply without a version string", () => {
+    expect(isHello({ proxy })).toBe(false);
+    expect(isHello({ version: 1, proxy })).toBe(false);
+  });
+
   it.each([0, 65536, 1.5, "8123"])("rejects port %j", (port) => {
     expect(isHello({ version: "0.1.0", proxy: { ...proxy, port } })).toBe(false);
   });

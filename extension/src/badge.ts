@@ -28,7 +28,9 @@ export interface BadgeInput {
  */
 export function badgeFor(input: BadgeInput): BadgeView {
   const { helper, state, mode } = input;
-  if (helper.kind === "notInstalled" || helper.kind === "failed") return ERROR;
+  if (helper.kind === "notInstalled" || helper.kind === "notAllowed" || helper.kind === "failed") {
+    return ERROR;
+  }
   if (input.error !== null || state?.error) return ERROR;
   if (mode === "failClosed") return STOP;
   if (mode === "connected" && state !== null) {

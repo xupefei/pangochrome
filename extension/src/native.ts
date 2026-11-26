@@ -12,6 +12,7 @@ export interface NativePort {
 
 export type HelperFailure =
   | { kind: "notInstalled"; message: string }
+  | { kind: "notAllowed"; message: string }
   | { kind: "failed"; message: string };
 
 export type NativeEvent =
@@ -212,8 +213,8 @@ export class NativeClient {
 }
 
 /**
- * Maps Chrome's disconnect text to a failure kind. A missing helper is the
- * only kind the popup can fix by installing it, so it gets its own kind.
+ * Maps Chrome's disconnect text to a failure kind. Each kind needs its own
+ * command from the user: install the helper, or allow this extension's ID.
  */
 export function classifyDisconnect(lastError: string): HelperFailure {
   const normalized = lastError.toLowerCase();
@@ -222,6 +223,9 @@ export function classifyDisconnect(lastError: string): HelperFailure {
     normalized.includes("no such native application")
   ) {
     return { kind: "notInstalled", message: "The helper is not installed." };
+  }
+  if (/native messaging host .*(forbidden|not allowed)/.test(normalized)) {
+    return { kind: "notAllowed", message: "The helper does not allow this extension." };
   }
   return {
     kind: "failed",

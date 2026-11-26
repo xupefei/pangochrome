@@ -38,7 +38,7 @@ Pangochrome is not made by the Pangolin team.
 **Graphic assets** (from `store-assets/`):
 
 - Store icon: the 128×128 icon in the zip.
-- Screenshots (1280×800): `screenshot-connected.png`, `screenshot-login.png`.
+- Screenshot (1280×800): `screenshot-connected.png`.
 - Small promo tile (440×280): `promo-small.png`.
 
 **Additional fields:**
@@ -65,8 +65,8 @@ Send this Chrome profile's traffic for the user's Pangolin resources, and with a
 
 **Remote code:** "No, I am not using remote code."
 
-**Data usage.** These are my reading of the form. You are the publisher, so
-check them against `docs/PRIVACY.md`:
+**Data usage.** Check these answers against `docs/PRIVACY.md` before you
+submit:
 
 - Personally identifiable information: yes. The popup shows the email address
   and name from the user's Pangolin server. The helper keeps them on the
