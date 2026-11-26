@@ -99,7 +99,8 @@ func (t *tunnel) start(cfg tunnelConfig) error {
 	o, err := olm.Init(ctx, olm.OlmConfig{
 		LogLevel: t.logLevel,
 		Agent:    "Pangochrome",
-		Version:  t.version,
+		// Pangolin shows "<agent> v<version>", so the version goes without its v.
+		Version:  strings.TrimPrefix(t.version, "v"),
 		Netstack: true,
 		OnConnected: func() {
 			t.events.connected()
