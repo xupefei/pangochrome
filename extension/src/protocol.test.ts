@@ -45,6 +45,13 @@ describe("isState", () => {
     expect(isState({ ...minimal, sites })).toBe(false);
   });
 
+  it("accepts an exit node with or without a connected flag", () => {
+    const exitNode = { siteResourceId: 1, name: "G", active: true };
+    expect(isState({ ...minimal, exitNode })).toBe(true);
+    expect(isState({ ...minimal, exitNode: { ...exitNode, connected: false } })).toBe(true);
+    expect(isState({ ...minimal, exitNode: { ...exitNode, connected: "no" } })).toBe(false);
+  });
+
   it("rejects an exit node without an active flag", () => {
     expect(isState({ ...minimal, exitNode: { siteResourceId: 1, name: "G" } })).toBe(false);
   });

@@ -54,8 +54,10 @@ test-helper: prepare
 
 # Upstream tests of the packages that the patches touch.
 test-upstream: prepare
-	cd host/third_party/olm && go test ./api/... ./dns/... ./olm/... ./peers/...
+	cd host/third_party/olm && go test ./api/... ./dns/... ./olm/... ./peers/... ./websocket/...
 	cd host/third_party/newt && go test ./holepunch/... ./network/...
+	# Upstream's TestSharedBindConcurrentWrites hangs, so only our bind test runs.
+	cd host/third_party/newt && go test ./bind/ -run TestIsSoftReceiveError
 
 test-extension: $(NODE_MODULES)
 	cd extension && npm test && npm run typecheck

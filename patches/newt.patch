@@ -1,3 +1,94 @@
+diff --git a/bind/shared_bind.go b/bind/shared_bind.go
+index 4e56e907f0025db8c864686618215b6c7a117ebc..72d80c28f1bffcfbee14ef4b5ab0d5597baa20d2 100644
+--- a/bind/shared_bind.go
++++ b/bind/shared_bind.go
+@@ -4,12 +4,14 @@ package bind
+ 
+ import (
+ 	"bytes"
++	"errors"
+ 	"fmt"
+ 	"net"
+ 	"net/netip"
+ 	"runtime"
+ 	"sync"
+ 	"sync/atomic"
++	"syscall"
+ 
+ 	"github.com/fosrl/newt/logger"
+ 	"golang.org/x/net/ipv4"
+@@ -567,6 +569,14 @@ func (b *SharedBind) makeReceiveSocket() wgConn.ReceiveFunc {
+ 					continue
+ 				}
+ 
++				// An error left by an earlier send is no reason to stop
++				// reading: WireGuard ends its receive routine for good on a
++				// non-temporary error, and every later packet is then lost.
++				if isSoftReceiveError(err) {
++					logger.Debug("Ignoring receive error from an earlier send: %v", err)
++					continue
++				}
++
+ 				// Not rebinding, return the error
+ 				return 0, err
+ 			}
+@@ -576,6 +586,23 @@ func (b *SharedBind) makeReceiveSocket() wgConn.ReceiveFunc {
+ 	}
+ }
+ 
++// isSoftReceiveError reports whether a receive error belongs to an earlier
++// send rather than to the socket. A UDP socket reports ICMP errors, and on
++// macOS also failed sends that a content filter saw, on its next receive. A
++// hole punch to an IPv6 address on an IPv4-only network causes one. The
++// socket itself is fine, so the caller reads again.
++func isSoftReceiveError(err error) bool {
++	for _, errno := range []syscall.Errno{
++		syscall.EHOSTUNREACH, syscall.ENETUNREACH, syscall.EHOSTDOWN,
++		syscall.ENETDOWN, syscall.ECONNREFUSED, syscall.EADDRNOTAVAIL,
++	} {
++		if errors.Is(err, errno) {
++			return true
++		}
++	}
++	return false
++}
++
+ // makeReceiveNetstack creates a receive function for netstack-injected packets
+ func (b *SharedBind) makeReceiveNetstack() wgConn.ReceiveFunc {
+ 	return func(bufs [][]byte, sizes []int, eps []wgConn.Endpoint) (n int, err error) {
+diff --git a/bind/soft_error_test.go b/bind/soft_error_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..5f6580c62adca029c886f2ff930e6e8a1cd67d6f
+--- /dev/null
++++ b/bind/soft_error_test.go
+@@ -0,0 +1,27 @@
++package bind
++
++import (
++	"errors"
++	"net"
++	"os"
++	"syscall"
++	"testing"
++)
++
++func TestIsSoftReceiveError(t *testing.T) {
++	// The error ReadFromUDP returns on macOS after a failed send:
++	// "read udp [::]:55710: recvfrom: no route to host".
++	wrap := func(errno syscall.Errno) error {
++		return &net.OpError{Op: "read", Net: "udp", Err: os.NewSyscallError("recvfrom", errno)}
++	}
++	for _, errno := range []syscall.Errno{syscall.EHOSTUNREACH, syscall.ENETUNREACH, syscall.ECONNREFUSED} {
++		if !isSoftReceiveError(wrap(errno)) {
++			t.Errorf("%v: want a soft error, so that the receive loop keeps reading", errno)
++		}
++	}
++	for _, err := range []error{net.ErrClosed, wrap(syscall.EBADF), errors.New("other")} {
++		if isSoftReceiveError(err) {
++			t.Errorf("%v: want a hard error", err)
++		}
++	}
++}
 diff --git a/holepunch/tester.go b/holepunch/tester.go
 index 6fa293455ab4cc3c89d22a9fa5d3388e7d0bce39..cf3f17261d4f2348b4ed6d57b9bb436ae80fa035 100644
 --- a/holepunch/tester.go

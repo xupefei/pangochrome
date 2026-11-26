@@ -22,8 +22,19 @@ type account struct {
 	Name         string                  `json:"name,omitempty"`
 	OrgID        string                  `json:"orgId,omitempty"`
 	Olm          pangolin.OlmCredentials `json:"olm"`
+	// WireGuardKey is the device's WireGuard private key in base64. The
+	// helper keeps it between tunnels, see server.wireGuardKey.
+	WireGuardKey string `json:"wireGuardKey,omitempty"`
 	// ExitNodes maps an org ID to the chosen exit node of that org.
 	ExitNodes map[string]exitNodeChoice `json:"exitNodes,omitempty"`
+}
+
+// olmID returns the account's device ID, or "" for a nil account.
+func (a *account) olmID() string {
+	if a == nil {
+		return ""
+	}
+	return a.Olm.ID
 }
 
 type exitNodeChoice struct {

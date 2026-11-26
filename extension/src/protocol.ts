@@ -57,6 +57,8 @@ export interface ExitNodeState {
   siteResourceId: number;
   name: string;
   active: boolean;
+  /** A WireGuard link to one of its sites is up. Older helpers leave it out. */
+  connected?: boolean;
 }
 
 export interface State {
@@ -201,7 +203,8 @@ function isExitNodeState(value: unknown): boolean {
     isRecord(value) &&
     isNumber(value["siteResourceId"]) &&
     isString(value["name"]) &&
-    isBoolean(value["active"])
+    isBoolean(value["active"]) &&
+    isOptional(value["connected"], isBoolean)
   );
 }
 

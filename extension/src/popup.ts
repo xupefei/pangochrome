@@ -391,9 +391,12 @@ function header(state: State, snap: Snapshot): HTMLElement {
 function statusText(state: State, snap: Snapshot): string {
   if (state.phase === "connecting") return "Connecting...";
   if (state.phase === "connected" && snap.mode === "connected") {
-    return state.exitNode?.active === true
-      ? `Connected via exit node ${state.exitNode.name}`
-      : "Connected";
+    const exitNode = state.exitNode;
+    if (exitNode?.active !== true) return "Connected";
+    // An older helper does not report the link; treat it as up.
+    return exitNode.connected === false
+      ? `Waiting for exit node ${exitNode.name} to connect...`
+      : `Connected via exit node ${exitNode.name}`;
   }
   return "Disconnected";
 }

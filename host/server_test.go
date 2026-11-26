@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+
 	"pangochrome/host/pangolin"
 )
 
@@ -160,5 +162,53 @@ func waitFor(t *testing.T, cond func() bool, msg string) {
 			t.Fatal(msg)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestWireGuardKeyIsCreatedOnceAndSaved(t *testing.T) {
+	s := newTestServer(t)
+	s.acct = &account{Server: "https://p.example.com", SessionToken: "tok", Olm: pangolin.OlmCredentials{ID: "olm1"}}
+
+	first, err := s.wireGuardKey("tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wgtypes.ParseKey(first); err != nil {
+		t.Fatalf("not a WireGuard key: %q", first)
+	}
+	again, err := s.wireGuardKey("tok")
+	if err != nil || again != first {
+		t.Fatalf("second call = %q, %v; want the same key", again, err)
+	}
+	saved, err := s.store.load()
+	if err != nil || saved == nil || saved.WireGuardKey != first {
+		t.Fatalf("saved account = %+v, %v; want the key saved", saved, err)
+	}
+
+	// A damaged key is replaced, not passed to olm.
+	s.acct.WireGuardKey = "damaged"
+	replaced, err := s.wireGuardKey("tok")
+	if err != nil || replaced == "damaged" || replaced == first {
+		t.Fatalf("damaged key: got %q, %v; want a new key", replaced, err)
+	}
+
+	if _, err := s.wireGuardKey("other-session"); err == nil {
+		t.Fatal("returned a key for another session")
+	}
+}
+
+func TestExitNodeConnectedNeedsALink(t *testing.T) {
+	s := newTestServer(t)
+	s.acct = &account{
+		SessionToken: "tok", OrgID: "acme",
+		ExitNodes: map[string]exitNodeChoice{"acme": {SiteResourceID: 5, Name: "Home"}},
+	}
+	ts := tunnelStatus{running: true, registered: true, gatewayActive: true, gatewayID: 5}
+	if v := s.stateFrom(ts); v.ExitNode == nil || !v.ExitNode.Active || v.ExitNode.Connected {
+		t.Fatalf("no link: %+v, want active but not connected", v.ExitNode)
+	}
+	ts.gatewayLinked = true
+	if v := s.stateFrom(ts); !v.ExitNode.Connected {
+		t.Fatalf("link up: %+v, want connected", v.ExitNode)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/netip"
 	"os"
@@ -22,6 +23,9 @@ import (
 var (
 	errTunnelDown = errors.New("tunnel is not connected")
 	errBadPort    = errors.New("invalid port")
+	// errExitNodeDown wraps the error of a request that needed the exit node
+	// while no WireGuard link to any of its sites was up.
+	errExitNodeDown = errors.New("the exit node is not connected")
 )
 
 // Pangolin puts client and alias addresses in this range.
@@ -43,6 +47,8 @@ type tunnelConfig struct {
 	OlmSecret string
 	UserToken string
 	OrgID     string
+	// PrivateKey is the WireGuard private key, base64. Empty: olm makes one.
+	PrivateKey string
 }
 
 // tunnelEvents are called from olm goroutines and from stop, never with a
@@ -60,6 +66,8 @@ type tunnelEvents struct {
 type tunnel struct {
 	version string
 	events  tunnelEvents
+	// logLevel is olm's log level, "INFO" unless debug logging is on.
+	logLevel string
 
 	// life makes start and teardown run one at a time, so a new tunnel never
 	// starts while the previous one is still tearing down.
@@ -75,7 +83,7 @@ type tunnelRun struct {
 }
 
 func newTunnel(version string, events tunnelEvents) *tunnel {
-	return &tunnel{version: version, events: events}
+	return &tunnel{version: version, events: events, logLevel: "INFO"}
 }
 
 func (t *tunnel) start(cfg tunnelConfig) error {
@@ -89,7 +97,7 @@ func (t *tunnel) start(cfg tunnelConfig) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	run := &tunnelRun{cancel: cancel, done: make(chan struct{})}
 	o, err := olm.Init(ctx, olm.OlmConfig{
-		LogLevel: "INFO",
+		LogLevel: t.logLevel,
 		Agent:    "Pangochrome",
 		Version:  t.version,
 		Netstack: true,
@@ -112,13 +120,14 @@ func (t *tunnel) start(cfg tunnelConfig) error {
 	t.run = run
 	go func() {
 		o.StartTunnel(olm.TunnelConfig{
-			Endpoint:  cfg.Server,
-			ID:        cfg.OlmID,
-			Secret:    cfg.OlmSecret,
-			UserToken: cfg.UserToken,
-			OrgID:     cfg.OrgID,
-			MTU:       tunnelMTU,
-			Holepunch: true,
+			Endpoint:   cfg.Server,
+			ID:         cfg.OlmID,
+			Secret:     cfg.OlmSecret,
+			UserToken:  cfg.UserToken,
+			OrgID:      cfg.OrgID,
+			MTU:        tunnelMTU,
+			PrivateKey: cfg.PrivateKey,
+			Holepunch:  true,
 			// Never touch the host resolver: the browser reaches aliases
 			// through the proxy, not through system DNS.
 			NativeDNSManaged:   true,
@@ -176,6 +185,7 @@ func (t *tunnel) endedByOlm(run *tunnelRun, fallback string) {
 	if st := run.o.GetStatus(); st.OlmError != nil && st.OlmError.Message != "" {
 		reason = st.OlmError.Message
 	}
+	log.Printf("tunnel: olm ended the tunnel: %s", reason)
 	go t.stopRun(run)
 	t.events.stopped(reason)
 }
@@ -243,6 +253,7 @@ type tunnelStatus struct {
 	routes        routes
 	gatewayActive bool
 	gatewayID     int
+	gatewayLinked bool // a WireGuard link to one of the gateway's sites is up
 }
 
 func (t *tunnel) status() tunnelStatus {
@@ -256,6 +267,7 @@ func (t *tunnel) status() tunnelStatus {
 		registered:    st.Registered,
 		gatewayActive: st.GatewayActive,
 		gatewayID:     st.GatewaySiteResourceId,
+		gatewayLinked: gatewayLinked(st),
 	}
 	if st.OlmError != nil {
 		s.olmError = st.OlmError.Message
@@ -387,15 +399,23 @@ func (t *tunnel) dial(ctx context.Context, host, port string) (net.Conn, error) 
 		return nil, fmt.Errorf("%w %q", errBadPort, port)
 	}
 	host = normaliseName(strings.Trim(host, "[]"))
-	addrs, err := resolveDestination(host, o.GetStatus().GatewayActive, sitePrefixes(o.Sites()),
+	prefixes := sitePrefixes(o.Sites())
+	// viaExitNode is set when the destination is neither a Pangolin alias
+	// nor inside a site network, so only the exit node can reach it.
+	viaExitNode := false
+	if ip, err := netip.ParseAddr(host); err == nil && !inPrefixes(ip.Unmap(), prefixes) {
+		viaExitNode = true
+	}
+	addrs, err := resolveDestination(host, o.GetStatus().GatewayActive, prefixes,
 		o.ResolveAlias,
 		func(name string) ([]string, error) {
+			viaExitNode = true
 			return lookupOverTCP(ctx, exitNodeDNS, name, func(ctx context.Context, server netip.AddrPort) (net.Conn, error) {
 				return tnet.DialContextTCPAddrPort(ctx, server)
 			})
 		})
 	if err != nil {
-		return nil, err
+		return nil, explainExitNode(o.GetStatus(), viaExitNode, err)
 	}
 	lastErr := errNotAllowed
 	for _, a := range addrs {
@@ -405,7 +425,28 @@ func (t *tunnel) dial(ctx context.Context, host, port string) (net.Conn, error) 
 		}
 		lastErr = err
 	}
-	return nil, lastErr
+	return nil, explainExitNode(o.GetStatus(), viaExitNode, lastErr)
+}
+
+// gatewayLinked reports whether a WireGuard link to one of the exit node's
+// sites is up.
+func gatewayLinked(st api.StatusResponse) bool {
+	for _, id := range st.GatewaySiteIds {
+		if ps := st.PeerStatuses[id]; ps != nil && ps.Connected {
+			return true
+		}
+	}
+	return false
+}
+
+// explainExitNode marks the error of a request that needed the exit node
+// with errExitNodeDown when no link to the exit node is up. Without it, the
+// failure shows up as a DNS timeout, which points the wrong way.
+func explainExitNode(st api.StatusResponse, viaExitNode bool, err error) error {
+	if !viaExitNode || !st.GatewayActive || errors.Is(err, errNotAllowed) || gatewayLinked(st) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", errExitNodeDown, err)
 }
 
 // lookupOverTCP returns the IPv4 addresses of name, asking each server in

@@ -103,6 +103,12 @@ allows. To also allow another ID, such as the Chrome Web Store build's, run
 Each browser profile has its own device and login. `docs/PRIVACY.md` lists
 what the helper keeps, and where.
 
+The helper logs to `helper.log` in `~/Library/Application Support/pangochrome`
+on macOS and `~/.config/pangochrome` on Linux. To add olm's and WireGuard's
+debug logs, create an empty file named `debug` in the same folder and
+reconnect. Debug logs leave out secrets, but they are long; delete the file
+when you are done.
+
 ## Test
 
 ```sh

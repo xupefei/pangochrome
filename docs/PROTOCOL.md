@@ -102,6 +102,8 @@ interface State {
     siteResourceId: number;
     name: string;
     active: boolean;        // true when the tunnel routes all traffic through it
+    connected?: boolean;    // true when a WireGuard link to one of its sites is up;
+                            // active can be true before that. Older helpers omit it.
   };
 }
 

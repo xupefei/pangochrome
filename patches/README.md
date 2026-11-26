@@ -53,7 +53,16 @@ https://github.com/xupefei/olm.
   "concurrent map read and map write".
 - `olm/netstack.go` (new): device creation and the `Net`, `ResolveAlias`,
   `AliasNames` and `Sites` accessors.
-- `olm/types.go`: `OlmConfig.Netstack`.
+- `olm/types.go`: `OlmConfig.Netstack`, and `TunnelConfig.PrivateKey`, a
+  WireGuard key that the embedder keeps between tunnels. Upstream olm makes
+  a new key for every tunnel, and the server then clears the client's
+  session, including the endpoint that the relay learned for it.
+- `olm/olm.go`, `olm/privatekey_test.go`: `initTunnelInfo` uses
+  `TunnelConfig.PrivateKey` when it is set.
+- `olm/olm.go`, `websocket/client.go`, `websocket/redact.go` (new): debug
+  logs leave out the olm secret, the user token and the WireGuard key.
+  Upstream logs the whole tunnel config, the token request body and every
+  ping, which carries the token.
 - `dns/resolve_local.go` (new): `DNSProxy.ResolveLocal`, an in-process alias
   lookup that also starts a just-in-time site connection, and
   `DNSProxy.LocalNames`, the list of alias names.
@@ -75,6 +84,15 @@ https://github.com/xupefei/newt, for upstream:
   content filter attached (endpoint security software uses one), each failed
   IPv6 send was reported on the WireGuard socket's next send, usually a
   handshake, and the tunnel never came up.
+
+- `receive-soft-errors` (`bind/shared_bind.go`, `bind/soft_error_test.go`):
+  the shared socket's receive function reads on after "no route to host",
+  "connection refused" and similar errors. A UDP socket reports such an
+  error from an earlier send on its next receive; on macOS a content filter
+  makes this common. Hole punches to an exit node's IPv6 address on an
+  IPv4-only network cause one. WireGuard ends its receive routine on the
+  first non-temporary error, so without this the device never read another
+  packet: handshake responses and hole-punch replies arrived and were lost.
 
 ## Known limits
 

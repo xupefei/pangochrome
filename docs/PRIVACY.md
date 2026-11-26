@@ -26,10 +26,14 @@ only your user account can read them.
 - The organisation and exit nodes that you chose.
 - The device credentials that your Pangolin server issued for this browser
   profile.
+- The WireGuard private key of this browser profile's device. The helper keeps
+  it between connections; it never leaves your computer.
 - A log file, `helper.log`. It records connection events of the Pangolin
   client: site names and IDs, endpoint addresses, public keys and DNS
   settings. It also records the host names of connections that failed. With
-  an exit node on, those can be public websites.
+  an exit node on, those can be public websites. If you create a file named
+  `debug` next to it, the log also gets the Pangolin client's debug messages,
+  with secrets left out.
 
 The proxy credentials between the extension and the helper exist only in
 memory.

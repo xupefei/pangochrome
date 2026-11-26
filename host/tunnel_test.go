@@ -145,3 +145,30 @@ func TestBuildSitesOrderIsStable(t *testing.T) {
 		t.Fatalf("shared alias should go to the lower site ID: %+v", first)
 	}
 }
+
+func TestExplainExitNode(t *testing.T) {
+	lookupErr := errors.New("lookup example.com.: i/o timeout")
+	down := api.StatusResponse{
+		GatewayActive:  true,
+		GatewaySiteIds: []int{2, 6},
+		PeerStatuses:   map[int]*api.PeerStatus{2: {Connected: false}, 6: {Connected: false}},
+	}
+	up := down
+	up.PeerStatuses = map[int]*api.PeerStatus{2: {Connected: false}, 6: {Connected: true}}
+
+	if err := explainExitNode(down, true, lookupErr); !errors.Is(err, errExitNodeDown) || !errors.Is(err, lookupErr) {
+		t.Errorf("no link: %v, want errExitNodeDown wrapping the lookup error", err)
+	}
+	if err := explainExitNode(up, true, lookupErr); err != lookupErr {
+		t.Errorf("link up: %v, want the error unchanged", err)
+	}
+	if err := explainExitNode(down, false, lookupErr); err != lookupErr {
+		t.Errorf("site destination: %v, want the error unchanged", err)
+	}
+	if err := explainExitNode(down, true, errNotAllowed); err != errNotAllowed {
+		t.Errorf("refused destination: %v, want errNotAllowed unchanged", err)
+	}
+	if err := explainExitNode(api.StatusResponse{}, true, lookupErr); err != lookupErr {
+		t.Errorf("no exit node: %v, want the error unchanged", err)
+	}
+}

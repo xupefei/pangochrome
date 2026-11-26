@@ -16,6 +16,8 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+
 	"pangochrome/host/pangolin"
 )
 
@@ -76,6 +78,9 @@ type exitNodeView struct {
 	SiteResourceID int    `json:"siteResourceId"`
 	Name           string `json:"name"`
 	Active         bool   `json:"active"`
+	// Connected is true when a WireGuard link to one of the exit node's
+	// sites is up. Active can be true before that.
+	Connected bool `json:"connected"`
 }
 
 type stateView struct {
@@ -127,6 +132,10 @@ var errNotLoggedIn = errors.New("log in to Pangolin first")
 const sessionEndedMessage = "Your Pangolin session ended. Log in again."
 
 func (s *server) handle(req request) {
+	// getState and listExitNodes come often and change nothing.
+	if req.Cmd != "getState" && req.Cmd != "listExitNodes" {
+		log.Printf("request %d: %s", req.ID, req.Cmd)
+	}
 	if changesState(req.Cmd) {
 		s.cmdMu.Lock()
 		defer s.cmdMu.Unlock()
@@ -468,6 +477,9 @@ func (s *server) finishLogin(flow *loginFlow, c *pangolin.Client) error {
 		acct.ExitNodes = prev.ExitNodes
 		acct.OrgID = prev.OrgID
 	}
+	if creds.ID == prev.olmID() {
+		acct.WireGuardKey = prev.WireGuardKey
+	}
 	if !hasOrg(orgs, acct.OrgID) {
 		acct.OrgID = ""
 		if len(orgs) > 0 {
@@ -519,6 +531,7 @@ func (s *server) sessionEnded(token string) {
 	}
 	s.lastErr = sessionEndedMessage
 	s.mu.Unlock()
+	log.Printf("session ended: the server refused the session token")
 	go func() {
 		s.tun.stop()
 		s.pushState()
@@ -604,14 +617,43 @@ func (s *server) connect() error {
 	if acct.OrgID == "" {
 		return errors.New("choose an organisation first")
 	}
+	key, err := s.wireGuardKey(acct.SessionToken)
+	if err != nil {
+		return err
+	}
 	s.setError("")
 	return s.tun.start(tunnelConfig{
-		Server:    acct.Server,
-		OlmID:     acct.Olm.ID,
-		OlmSecret: acct.Olm.Secret,
-		UserToken: acct.SessionToken,
-		OrgID:     acct.OrgID,
+		Server:     acct.Server,
+		OlmID:      acct.Olm.ID,
+		OlmSecret:  acct.Olm.Secret,
+		UserToken:  acct.SessionToken,
+		OrgID:      acct.OrgID,
+		PrivateKey: key,
 	})
+}
+
+// wireGuardKey returns the device's saved WireGuard private key, and creates
+// and saves one when there is none. With a new key on every connect the
+// server clears the client's session each time, including the endpoint that
+// the relay learned for it.
+func (s *server) wireGuardKey(token string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.sameSession(token) {
+		return "", errors.New("the session changed, try again")
+	}
+	if _, err := wgtypes.ParseKey(s.acct.WireGuardKey); err == nil {
+		return s.acct.WireGuardKey, nil
+	}
+	k, err := wgtypes.GeneratePrivateKey()
+	if err != nil {
+		return "", err
+	}
+	s.acct.WireGuardKey = k.String()
+	if err := s.store.save(s.acct); err != nil {
+		return "", fmt.Errorf("cannot save the WireGuard key: %w", err)
+	}
+	return s.acct.WireGuardKey, nil
 }
 
 // fetchGateways loads the gateway list of the current org and caches it.
@@ -792,8 +834,11 @@ func (s *server) applyExitNode(id int, tracked map[int]bool) error {
 }
 
 func (s *server) state() stateView {
-	ts := s.tun.status()
+	return s.stateFrom(s.tun.status())
+}
 
+// stateFrom builds the state from a tunnel status, so tests can pass one.
+func (s *server) stateFrom(ts tunnelStatus) stateView {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	v := stateView{
@@ -832,6 +877,7 @@ func (s *server) state() stateView {
 				Name:           choice.Name,
 				Active:         v.Phase == "connected" && ts.gatewayActive && ts.gatewayID == id,
 			}
+			v.ExitNode.Connected = v.ExitNode.Active && ts.gatewayLinked
 		}
 	}
 	if v.Phase == "loggedOut" || v.Phase == "loggingIn" {

@@ -190,6 +190,9 @@ func writeDialError(w http.ResponseWriter, target string, err error) {
 		http.Error(w, "invalid port in "+target, http.StatusBadRequest)
 	case errors.Is(err, errTunnelDown):
 		http.Error(w, "the Pangolin tunnel is not connected", http.StatusBadGateway)
+	case errors.Is(err, errExitNodeDown):
+		log.Printf("proxy: dial %s: %v", target, err)
+		http.Error(w, "the exit node is not connected, so "+target+" cannot be reached", http.StatusBadGateway)
 	default:
 		log.Printf("proxy: dial %s: %v", target, err)
 		http.Error(w, "cannot reach "+target+" through Pangolin", http.StatusBadGateway)

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -71,6 +72,8 @@ func runHost(in io.Reader) int {
 	if err := setUpLogging(baseDir); err != nil {
 		log.Printf("logging: %v", err)
 	}
+	exe, _ := os.Executable()
+	log.Printf("pangochrome-helper %s starting: %s/%s, pid %d, %s", version, runtime.GOOS, runtime.GOARCH, os.Getpid(), exe)
 
 	s := &server{version: version, baseDir: baseDir, out: out, userAgent: "pangochrome-helper/" + version}
 	s.tun = newTunnel(version, tunnelEvents{
@@ -82,6 +85,12 @@ func runHost(in io.Reader) int {
 		},
 		authError: func() { go s.onTunnelAuthError() },
 	})
+	// Creating <base>/debug turns on olm's and WireGuard's debug logs, for
+	// support. They are verbose, so it is off unless asked for.
+	if _, err := os.Stat(filepath.Join(baseDir, "debug")); err == nil {
+		s.tun.logLevel = "DEBUG"
+		log.Printf("debug logging is on (%s exists)", filepath.Join(baseDir, "debug"))
+	}
 	s.proxy, err = newLocalProxy(s.tun.dial)
 	if err != nil {
 		log.Printf("start proxy: %v", err)
@@ -133,6 +142,7 @@ func runHost(in io.Reader) int {
 	}
 
 	// Chrome closed the port: the extension was unloaded or the browser quit.
+	log.Printf("pangochrome-helper %s stopping: the browser closed the connection", version)
 	out.close()
 	s.tun.stop()
 	_ = s.proxy.close()
