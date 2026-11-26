@@ -7,6 +7,25 @@ Pangolin Cloud and with self-hosted Pangolin.
 Only the browser profile that runs the extension uses the tunnel. Other apps
 and other profiles keep the normal network.
 
+Pangochrome is tested on macOS. The Linux helper is built and unit-tested,
+but nobody has tried it in a real Linux desktop yet. Windows is not supported.
+
+## Install
+
+1. Install the Pangochrome extension.
+2. Open its popup. It shows a command for your system, for example:
+
+   ```sh
+   curl -fsSL https://github.com/xupefei/pangochrome/releases/download/v0.1.0/install.sh | sh -s -- --version v0.1.0 --extension-id <id>
+   ```
+
+3. Run the command in a terminal, then press **Retry** in the popup.
+
+The script downloads the helper of that release, checks it against the
+release's `SHA256SUMS.txt`, installs it as `~/.local/bin/pangochrome-helper`
+and registers it with Chrome, Chromium, Brave and Microsoft Edge. It needs no
+root. To remove the helper, run the same command with `--uninstall`.
+
 ## How it works
 
 Pangochrome has two parts:
@@ -19,9 +38,9 @@ Pangochrome has two parts:
   network stack, and serves an HTTP proxy on `127.0.0.1` that only the
   extension can use.
 
-The olm copy in `host/third_party/olm` has a small patch that adds this
-userspace mode, and the helper uses a newt build with two fixes that mode
-needs. See `host/third_party/olm/PANGOCHROME.md`.
+The helper builds against pinned upstream releases of olm and newt, with a
+patch each in `patches/`. The olm patch adds the userspace mode. The newt
+patch has two fixes that mode needs. See `patches/README.md`.
 `docs/PROTOCOL.md` defines the messages between the two parts and the
 routing rules.
 
@@ -48,6 +67,9 @@ make helper        # writes dist/pangochrome-helper
 make extension     # writes extension/dist
 make install-helper
 ```
+
+`make helper` first runs `make prepare`, which builds `host/third_party` from
+the pinned upstream releases and `patches/`.
 
 `make install-helper` registers `dist/pangochrome-helper` with Chrome,
 Chromium, Brave and Microsoft Edge for the current user, on Linux and macOS.
@@ -79,12 +101,27 @@ the same directory.
 make test
 ```
 
-This runs the helper's Go tests, the upstream olm tests for the patched
-packages, and the extension's unit tests.
+This runs the helper's Go tests, the upstream olm and newt tests for the
+patched packages, the extension's unit tests, and a test of `install.sh`
+against a local copy of a release. CI runs it on Linux and macOS.
+
+## Release
+
+1. Set the same version in `extension/static/manifest.json` and
+   `extension/package.json`.
+2. Push a tag `v<version>`, for example `v0.1.0`.
+
+The Release workflow runs the tests and publishes a GitHub release with the
+four helpers (`pangochrome-helper-{linux,darwin}-{amd64,arm64}`),
+`install.sh`, `pangochrome-extension-v<version>.zip` for the Chrome Web Store
+and `SHA256SUMS.txt`. The popup of extension version X installs the helper of
+release vX, so publish the release before you submit the zip to the store.
 
 ## Limits
 
-- Chrome only. The helper runs on Linux and macOS.
+- Chrome only. The helper runs on macOS and Linux. The helpers are not signed
+  with an Apple Developer ID. The install script works without one, because
+  macOS does not quarantine files that `curl` downloads.
 - The tunnel carries IPv4 TCP only. Chrome does not use QUIC through a
   proxy, so HTTP/3 sites use TCP instead.
 - A host name that resolves to a resource IP in public DNS goes direct. Use

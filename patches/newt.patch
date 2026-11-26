@@ -1,0 +1,555 @@
+diff --git a/holepunch/tester.go b/holepunch/tester.go
+index 6fa293455ab4cc3c89d22a9fa5d3388e7d0bce39..cf3f17261d4f2348b4ed6d57b9bb436ae80fa035 100644
+--- a/holepunch/tester.go
++++ b/holepunch/tester.go
+@@ -2,6 +2,7 @@ package holepunch
+ 
+ import (
+ 	"crypto/rand"
++	"errors"
+ 	"fmt"
+ 	"net"
+ 	"net/netip"
+@@ -281,6 +282,11 @@ func (t *HolepunchTester) TestEndpoint(endpoint string, timeout time.Duration) T
+ 		return result
+ 	}
+ 
++	if err := checkRoute(remoteAddr); err != nil {
++		result.Error = err
++		return result
++	}
++
+ 	// Generate random data for the test packet
+ 	randomData := make([]byte, bind.MagicPacketDataLen)
+ 	if _, err := rand.Read(randomData); err != nil {
+@@ -368,6 +374,11 @@ func TestConnectionWithBind(sharedBind *bind.SharedBind, endpoint string, opts *
+ 		return result
+ 	}
+ 
++	if err := checkRoute(remoteAddr); err != nil {
++		result.Error = err
++		return result
++	}
++
+ 	// Generate random data for the test packet
+ 	randomData := make([]byte, bind.MagicPacketDataLen)
+ 	if _, err := rand.Read(randomData); err != nil {
+@@ -422,3 +433,26 @@ func TestConnectionWithBind(sharedBind *bind.SharedBind, endpoint string, opts *
+ 
+ 	return result
+ }
++
++// ErrNoRoute is returned (wrapped) by TestEndpoint and TestConnectionWithBind
++// when this host has no route to the endpoint. No test packet is sent then.
++var ErrNoRoute = errors.New("no route to endpoint")
++
++// checkRoute reports an error if this host has no route to addr, such as an
++// IPv6 endpoint on an IPv4-only network. Connecting a throwaway UDP socket
++// only looks up the route; nothing is sent.
++//
++// Test packets go through the socket WireGuard uses, so they must not be sent
++// to unroutable endpoints. On macOS with a content filter attached (endpoint
++// security software uses one), the filter holds each outgoing datagram and
++// sends it later. When that send fails, the error is reported on the
++// socket's next send instead, which is often a WireGuard handshake to a peer
++// that is reachable. A site that advertises IPv6 local endpoints could then
++// stop a client on an IPv4-only network from connecting at all.
++func checkRoute(addr *net.UDPAddr) error {
++	c, err := net.DialUDP("udp", nil, addr)
++	if err != nil {
++		return fmt.Errorf("%w %s: %v", ErrNoRoute, addr, err)
++	}
++	return c.Close()
++}
+diff --git a/holepunch/tester_test.go b/holepunch/tester_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..12ecbcaf25e5ce43b748555ea32fb520af539a94
+--- /dev/null
++++ b/holepunch/tester_test.go
+@@ -0,0 +1,68 @@
++package holepunch
++
++import (
++	"errors"
++	"net"
++	"os"
++	"os/exec"
++	"testing"
++	"time"
++
++	"github.com/fosrl/newt/bind"
++)
++
++func TestCheckRouteLoopback(t *testing.T) {
++	if err := checkRoute(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}); err != nil {
++		t.Fatalf("checkRoute(127.0.0.1:9) = %v, want nil", err)
++	}
++}
++
++// TestUnroutableEndpointsNetns checks that TestEndpoint and
++// TestConnectionWithBind report ErrNoRoute for endpoints the host cannot
++// route to, before sending anything through the shared socket. It needs a
++// network namespace with only loopback, so that no address but 127.0.0.0/8
++// is routable:
++//
++//	NETNS_TEST=1 unshare -rn go test ./holepunch -run Netns -v
++func TestUnroutableEndpointsNetns(t *testing.T) {
++	if os.Getenv("NETNS_TEST") == "" {
++		t.Skip()
++	}
++	if out, err := exec.Command("ip", "link", "set", "lo", "up").CombinedOutput(); err != nil {
++		t.Fatalf("ip link set lo up: %v %s", err, out)
++	}
++	conn, err := net.ListenUDP("udp", &net.UDPAddr{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	sb, err := bind.New(conn)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer sb.Close()
++	tester := NewHolepunchTester(sb, nil)
++	if err := tester.Start(); err != nil {
++		t.Fatal(err)
++	}
++	defer tester.Stop()
++
++	for _, ep := range []string{"[2001:db8::1]:51820", "192.0.2.1:51820"} {
++		start := time.Now()
++		res := tester.TestEndpoint(ep, 2*time.Second)
++		if !errors.Is(res.Error, ErrNoRoute) {
++			t.Errorf("TestEndpoint(%s) error = %v, want ErrNoRoute", ep, res.Error)
++		}
++		if d := time.Since(start); d > time.Second {
++			t.Errorf("TestEndpoint(%s) took %v, want an immediate error", ep, d)
++		}
++	}
++	if res := TestConnectionWithBind(sb, "[2001:db8::1]:51820", nil); !errors.Is(res.Error, ErrNoRoute) {
++		t.Errorf("TestConnectionWithBind error = %v, want ErrNoRoute", res.Error)
++	}
++
++	// A routable endpoint is still tested. Nothing answers on 127.0.0.1:9,
++	// so this times out, after sending.
++	if res := tester.TestEndpoint("127.0.0.1:9", 300*time.Millisecond); errors.Is(res.Error, ErrNoRoute) || res.Error == nil {
++		t.Errorf("TestEndpoint(127.0.0.1:9) error = %v, want a timeout", res.Error)
++	}
++}
+diff --git a/network/interface.go b/network/interface.go
+index 72af5f457a25d83ad568a9a543957c20623b1ee4..fa4bfdeb317cc4056d326f01e6eae085ad20fd84 100644
+--- a/network/interface.go
++++ b/network/interface.go
+@@ -145,6 +145,10 @@ func configureDarwin(interfaceName string, ip net.IP, ipNet *net.IPNet) error {
+ }
+ 
+ func configureLinux(interfaceName string, ip net.IP, ipNet *net.IPNet) error {
++	if NativeConfigDisabled {
++		return nil
++	}
++
+ 	// Get the interface
+ 	link, err := netlink.LinkByName(interfaceName)
+ 	if err != nil {
+@@ -232,6 +236,10 @@ func RemoveSecondaryAddress(interfaceName string, addr string) error {
+ }
+ 
+ func removeLinuxAddress(interfaceName string, ip net.IP, ipNet *net.IPNet) error {
++	if NativeConfigDisabled {
++		return nil
++	}
++
+ 	link, err := netlink.LinkByName(interfaceName)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to get interface %s: %v", interfaceName, err)
+diff --git a/network/interface_windows.go b/network/interface_windows.go
+index 2b96e0bd36736dbbd9c2e2d978150265cfb50e48..d7f6a3471fa6def07be110be8a702d458a57794b 100644
+--- a/network/interface_windows.go
++++ b/network/interface_windows.go
+@@ -12,6 +12,10 @@ import (
+ )
+ 
+ func configureWindows(interfaceName string, ip net.IP, ipNet *net.IPNet) error {
++	if NativeConfigDisabled {
++		return nil
++	}
++
+ 	logger.Info("Configuring Windows interface: %s", interfaceName)
+ 
+ 	// Get the LUID for the interface
+@@ -63,6 +67,10 @@ func configureWindows(interfaceName string, ip net.IP, ipNet *net.IPNet) error {
+ }
+ 
+ func removeWindowsAddress(interfaceName string, ip net.IP, ipNet *net.IPNet) error {
++	if NativeConfigDisabled {
++		return nil
++	}
++
+ 	iface, err := net.InterfaceByName(interfaceName)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to get interface %s: %v", interfaceName, err)
+diff --git a/network/nativeconfig_netns_test.go b/network/nativeconfig_netns_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..962dbe076963c811dfddb4ef312297136e740f8a
+--- /dev/null
++++ b/network/nativeconfig_netns_test.go
+@@ -0,0 +1,106 @@
++//go:build linux
++
++package network
++
++import (
++	"context"
++	"os"
++	"os/exec"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++// TestNativeConfigDisabledNetns checks against a real kernel that, with
++// NativeConfigDisabled set, configuring a tunnel interface with its routes, a
++// bypass route and a gateway route - and removing them again - changes no
++// address or route, and that WatchRouteChanges does not watch. It then clears
++// the flag to show the same calls do change the namespace. It modifies the
++// routing table, so it only runs inside a throwaway network namespace:
++//
++//	NETNS_TEST=1 unshare -rn go test ./network -run TestNativeConfigDisabledNetns -v
++func TestNativeConfigDisabledNetns(t *testing.T) {
++	if os.Getenv("NETNS_TEST") == "" {
++		t.Skip()
++	}
++	// Own link names and replace rather than add, so this can share a
++	// namespace with TestBypassReconcileNetns.
++	for _, link := range []string{"ncphys0", "nctun0", "nctun1"} {
++		ipCmd(t, "link", "add", link, "type", "dummy")
++		ipCmd(t, "link", "set", link, "up")
++		t.Cleanup(func() { _ = exec.Command("ip", "link", "del", link).Run() })
++	}
++	ipCmd(t, "addr", "add", "10.77.0.2/24", "dev", "ncphys0")
++	ipCmd(t, "route", "replace", "default", "via", "10.77.0.1", "dev", "ncphys0")
++	hostState := func() string {
++		return ipCmd(t, "addr") + "\n" + ipCmd(t, "route", "show", "table", "all")
++	}
++	must := func(what string, err error) {
++		t.Helper()
++		if err != nil {
++			t.Fatalf("%s: %v", what, err)
++		}
++	}
++
++	ClearNetworkSettings()
++	NativeConfigDisabled = true
++	t.Cleanup(func() {
++		NativeConfigDisabled = false
++		ClearNetworkSettings()
++	})
++
++	var watched atomic.Int32
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	must("WatchRouteChanges", WatchRouteChanges(ctx, func() { watched.Add(1) }))
++
++	before := hostState()
++	must("ConfigureInterface", ConfigureInterface("nctun0", "100.64.0.2/24", 1280))
++	must("AddSecondaryAddress", AddSecondaryAddress("nctun0", "100.64.0.3/32"))
++	must("AddRoutesWithSource", AddRoutesWithSource([]string{"192.0.2.0/24"}, "nctun0", "100.64.0.2"))
++	must("AddBypassRouteForDestination", AddBypassRouteForDestination("198.51.100.1", "nctun0"))
++	must("AddGatewayDefaultRoute", AddGatewayDefaultRoute("nctun0", "100.64.0.2"))
++	if changed, err := ReconcileBypassRoute("198.51.100.1", "nctun0"); changed || err != nil {
++		t.Fatalf("ReconcileBypassRoute = %v, %v; want false, nil", changed, err)
++	}
++	if after := hostState(); after != before {
++		t.Fatalf("adding changed the namespace with NativeConfigDisabled set:\nbefore:\n%s\nafter:\n%s", before, after)
++	}
++	if got := GetSettings().IPv4Addresses; len(got) != 2 {
++		t.Errorf("IPv4Addresses = %v, want the tunnel's two addresses kept in NetworkSettings", got)
++	}
++
++	// Put in place what the calls above would have added, and check that the
++	// matching removals leave it alone. Adding it is also a route change that
++	// a running watcher would report.
++	ipCmd(t, "addr", "add", "100.64.0.3/32", "dev", "nctun0")
++	ipCmd(t, "route", "add", "192.0.2.0/24", "dev", "nctun0")
++	ipCmd(t, "route", "add", "198.51.100.1/32", "via", "10.77.0.1", "dev", "ncphys0")
++	ipCmd(t, "route", "replace", "0.0.0.0/1", "dev", "nctun0")
++	ipCmd(t, "route", "replace", "128.0.0.0/1", "dev", "nctun0")
++	before = hostState()
++	must("RemoveGatewayDefaultRoute", RemoveGatewayDefaultRoute("nctun0"))
++	must("RemoveBypassRouteForDestination", RemoveBypassRouteForDestination("198.51.100.1"))
++	must("RemoveRoutes", RemoveRoutes([]string{"192.0.2.0/24"}, "nctun0"))
++	must("RemoveSecondaryAddress", RemoveSecondaryAddress("nctun0", "100.64.0.3/32"))
++	if after := hostState(); after != before {
++		t.Fatalf("removing changed the namespace with NativeConfigDisabled set:\nbefore:\n%s\nafter:\n%s", before, after)
++	}
++
++	time.Sleep(routeChangeSettle + time.Second)
++	if n := watched.Load(); n != 0 {
++		t.Fatalf("WatchRouteChanges reported %d changes with NativeConfigDisabled set, want 0", n)
++	}
++
++	// Without the flag the same calls do change the namespace.
++	NativeConfigDisabled = false
++	must("ConfigureInterface", ConfigureInterface("nctun1", "100.65.0.2/24", 1280))
++	must("AddRoutesWithSource", AddRoutesWithSource([]string{"203.0.113.0/24"}, "nctun1", "100.65.0.2"))
++	if got := ipCmd(t, "addr", "show", "dev", "nctun1"); !strings.Contains(got, "100.65.0.2/24") {
++		t.Errorf("nctun1 addresses without NativeConfigDisabled:\n%s\nwant 100.65.0.2/24", got)
++	}
++	if got := ipCmd(t, "route", "show", "203.0.113.0/24"); !strings.Contains(got, "dev nctun1") {
++		t.Errorf("route to 203.0.113.0/24 without NativeConfigDisabled: %q, want one on nctun1", got)
++	}
++}
+diff --git a/network/nativeconfig_test.go b/network/nativeconfig_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..2ecf426cfc8600b1938e4604419ef714fe189c31
+--- /dev/null
++++ b/network/nativeconfig_test.go
+@@ -0,0 +1,97 @@
++package network
++
++import (
++	"runtime"
++	"testing"
++)
++
++const missingIface = "newttest-none0"
++
++// hostChangeCalls would each change the host's interfaces or routes. Every
++// one names an interface that does not exist or an address that does not
++// parse, so a call that reaches the OS returns an error - and cannot change
++// anything. goos is the platform whose code the call reaches, or "" for the
++// cross-platform entry points.
++var hostChangeCalls = []struct {
++	name string
++	goos string
++	call func() error
++}{
++	{"ConfigureInterface", "", func() error { return ConfigureInterface(missingIface, "100.64.0.2/24", 1280) }},
++	{"AddSecondaryAddress", "", func() error { return AddSecondaryAddress(missingIface, "100.64.0.3/32") }},
++	{"RemoveSecondaryAddress", "", func() error { return RemoveSecondaryAddress(missingIface, "100.64.0.3/32") }},
++	{"AddBypassRouteForDestination", "", func() error { return AddBypassRouteForDestination("not-an-ip", missingIface) }},
++	{"RemoveBypassRouteForDestination", "", func() error { return RemoveBypassRouteForDestination("not-an-ip") }},
++	{"LinuxAddRoute", "linux", func() error { return LinuxAddRoute("192.0.2.0/24", "", missingIface) }},
++	{"LinuxRemoveRoute", "linux", func() error { return LinuxRemoveRoute("192.0.2.0/24", missingIface) }},
++	{"LinuxAddBypassRoute", "linux", func() error { return LinuxAddBypassRoute("not-an-ip", missingIface) }},
++	{"LinuxRemoveBypassRoute", "linux", func() error { return LinuxRemoveBypassRoute("not-an-ip") }},
++	{"DarwinAddRouteWithSource", "darwin", func() error { return DarwinAddRouteWithSource("192.0.2.0/24", "", missingIface, "") }},
++	{"DarwinRemoveRoute", "darwin", func() error { return DarwinRemoveRoute("192.0.2.0/24") }},
++	{"DarwinAddBypassRoute", "darwin", func() error { return DarwinAddBypassRoute("not-an-ip", missingIface) }},
++	{"DarwinRemoveBypassRoute", "darwin", func() error { return DarwinRemoveBypassRoute("not-an-ip") }},
++	{"WindowsAddRoute", "windows", func() error { return WindowsAddRoute("192.0.2.0/24", "", missingIface) }},
++	{"WindowsRemoveRoute", "windows", func() error { return WindowsRemoveRoute("192.0.2.0/24", missingIface) }},
++	{"WindowsAddBypassRoute", "windows", func() error { return WindowsAddBypassRoute("not-an-ip", missingIface) }},
++	{"WindowsRemoveBypassRoute", "windows", func() error { return WindowsRemoveBypassRoute("not-an-ip") }},
++}
++
++// withNativeConfigDisabled sets NativeConfigDisabled for one test, starting
++// from NetworkSettings that already hold a primary tunnel address.
++func withNativeConfigDisabled(t *testing.T, disabled bool) {
++	t.Helper()
++	ClearNetworkSettings()
++	SetIPv4Settings([]string{"100.64.0.2"}, []string{"255.255.255.0"})
++	NativeConfigDisabled = disabled
++	t.Cleanup(func() {
++		NativeConfigDisabled = false
++		ClearNetworkSettings()
++	})
++}
++
++func TestNativeConfigDisabledSkipsHostChanges(t *testing.T) {
++	withNativeConfigDisabled(t, true)
++
++	for _, c := range hostChangeCalls {
++		if err := c.call(); err != nil {
++			t.Errorf("%s: %v, want nil without reaching the OS", c.name, err)
++		}
++	}
++	if ManagesHostRoutes() {
++		t.Error("ManagesHostRoutes() = true, want false")
++	}
++	if changed, err := ReconcileBypassRoute("not-an-ip", missingIface); changed || err != nil {
++		t.Errorf("ReconcileBypassRoute = %v, %v; want false, nil", changed, err)
++	}
++
++	// NetworkSettings is still kept for a host app that applies it itself.
++	if got := GetSettings().IPv4ExcludedRoutes; len(got) != 0 {
++		t.Errorf("IPv4ExcludedRoutes = %v, want the bypass route added and removed again", got)
++	}
++	if got := GetSettings().IPv4Addresses; len(got) != 1 || got[0] != "100.64.0.2" {
++		t.Errorf("IPv4Addresses = %v, want [100.64.0.2]", got)
++	}
++}
++
++// TestHostChangeCallsReachTheOSByDefault shows that the calls above fail when
++// they do reach the OS, so TestNativeConfigDisabledSkipsHostChanges would
++// notice a missing check. Linux only: there every one of these failures is an
++// interface lookup or a parse error, so nothing on the host can change.
++func TestHostChangeCallsReachTheOSByDefault(t *testing.T) {
++	if runtime.GOOS != "linux" {
++		t.Skip("only checked on linux")
++	}
++	withNativeConfigDisabled(t, false)
++
++	for _, c := range hostChangeCalls {
++		if c.goos != "" && c.goos != runtime.GOOS {
++			continue
++		}
++		if err := c.call(); err == nil {
++			t.Errorf("%s returned nil with NativeConfigDisabled unset, want an error from the OS", c.name)
++		}
++	}
++	if !ManagesHostRoutes() {
++		t.Error("ManagesHostRoutes() = false, want true")
++	}
++}
+diff --git a/network/route.go b/network/route.go
+index 80da7c67c5b76784548e4ebd2be254bf07fad938..d74c35840e1139ab08f6442772d3a25c0218569f 100644
+--- a/network/route.go
++++ b/network/route.go
+@@ -42,18 +42,29 @@ const VPNRouteMetric = 9999
+ // this to true (e.g. from a config value) before routes are added.
+ var PreferLocalRoutes = false
+ 
+-// NativeConfigDisabled, when true, skips the raw `ifconfig`/`route` subprocess
+-// calls this package otherwise makes on darwin (configureDarwin,
+-// removeDarwinAddress, DarwinAddRouteWithSource, DarwinRemoveRoute) while still
+-// populating the JSON-facing NetworkSettings state. This must be set when the
+-// TUN device's addresses/routes are instead owned by an external mechanism
+-// that reconciles them independently - namely Apple's NetworkExtension
+-// (NEPacketTunnelProvider.setTunnelNetworkSettings), which is the sole
+-// sanctioned way to configure that virtual interface. Running our own
+-// ifconfig/route commands in addition to NE applying its own settings was
+-// observed to install two competing routes to the same destination (one via
+-// NE's gatewayAddress-based route, one via our own `-ifa` route), so the two
+-// mechanisms must be mutually exclusive rather than layered.
++// NativeConfigDisabled, when true, makes this package leave the host's
++// interfaces and routing table alone on every platform, while still
++// populating the JSON-facing NetworkSettings state. The functions that would
++// add or remove an interface address or a route return without doing so
++// (configureDarwin/Linux/Windows, removeDarwin/Linux/WindowsAddress and the
++// Darwin*, Linux* and Windows* route functions), and ManagesHostRoutes
++// reports false, which also makes WatchRouteChanges and ReconcileBypassRoute
++// no-ops. Set it when the tunnel's addresses and routes are not this
++// package's to manage:
++//
++//   - The TUN device's addresses/routes are owned by an external mechanism
++//     that reconciles them independently - namely Apple's NetworkExtension
++//     (NEPacketTunnelProvider.setTunnelNetworkSettings), which is the sole
++//     sanctioned way to configure that virtual interface. Running our own
++//     ifconfig/route commands in addition to NE applying its own settings
++//     was observed to install two competing routes to the same destination
++//     (one via NE's gatewayAddress-based route, one via our own `-ifa`
++//     route), so the two mechanisms must be mutually exclusive rather than
++//     layered.
++//   - The WireGuard device has no OS interface at all, e.g. it runs on a
++//     userspace network stack (golang.zx2c4.com/wireguard/tun/netstack), so
++//     there is nothing on the host to configure and any route would capture
++//     host traffic for an interface that does not exist.
+ var NativeConfigDisabled = false
+ 
+ // DarwinAddRoute adds a route via the BSD routing table. Unlike Linux/Windows,
+@@ -133,6 +144,9 @@ func LinuxAddRoute(destination string, gateway string, interfaceName string) err
+ 	if runtime.GOOS != "linux" {
+ 		return nil
+ 	}
++	if NativeConfigDisabled {
++		return nil
++	}
+ 
+ 	// Parse destination CIDR
+ 	_, ipNet, err := net.ParseCIDR(destination)
+@@ -183,6 +197,9 @@ func LinuxRemoveRoute(destination string, interfaceName string) error {
+ 	if runtime.GOOS != "linux" {
+ 		return nil
+ 	}
++	if NativeConfigDisabled {
++		return nil
++	}
+ 
+ 	// Parse destination CIDR
+ 	_, ipNet, err := net.ParseCIDR(destination)
+@@ -236,6 +253,9 @@ func LinuxAddBypassRoute(destIP string, tunnelInterface string) error {
+ 	if runtime.GOOS != "linux" {
+ 		return nil
+ 	}
++	if NativeConfigDisabled {
++		return nil
++	}
+ 	_, err := linuxEnsureBypassRoute(destIP, tunnelInterface)
+ 	return err
+ }
+@@ -355,6 +375,9 @@ func LinuxRemoveBypassRoute(destIP string) error {
+ 	if runtime.GOOS != "linux" {
+ 		return nil
+ 	}
++	if NativeConfigDisabled {
++		return nil
++	}
+ 
+ 	ip := net.ParseIP(destIP)
+ 	if ip == nil {
+@@ -633,13 +656,15 @@ func ReconcileBypassRoute(destIP string, tunnelInterface string) (bool, error) {
+ 
+ // ManagesHostRoutes reports whether this package installs routes in the host
+ // OS routing table itself (desktop platforms), as opposed to only populating
+-// NetworkSettings for a mobile/NetworkExtension host app to apply.
++// NetworkSettings for a mobile/NetworkExtension host app to apply. False
++// while NativeConfigDisabled is set.
+ func ManagesHostRoutes() bool {
++	if NativeConfigDisabled {
++		return false
++	}
+ 	switch runtime.GOOS {
+-	case "linux", "windows":
++	case "linux", "windows", "darwin":
+ 		return true
+-	case "darwin":
+-		return !NativeConfigDisabled
+ 	}
+ 	return false
+ }
+diff --git a/network/route_windows.go b/network/route_windows.go
+index ad0ed121c738b745da3467fb09dce97d8246b3b8..5f06f0eee479d62c55a8e5fe9343f62a3abeb420 100644
+--- a/network/route_windows.go
++++ b/network/route_windows.go
+@@ -17,6 +17,9 @@ func WindowsAddRoute(destination string, gateway string, interfaceName string) e
+ 	if runtime.GOOS != "windows" {
+ 		return nil
+ 	}
++	if NativeConfigDisabled {
++		return nil
++	}
+ 
+ 	// Parse destination CIDR
+ 	_, ipNet, err := net.ParseCIDR(destination)
+@@ -110,6 +113,9 @@ func WindowsAddRoute(destination string, gateway string, interfaceName string) e
+ // (0.0.0.0/1 + 128.0.0.0/1 on the tunnel) is installed still resolves to the
+ // physical default route rather than back into the tunnel.
+ func WindowsAddBypassRoute(destIP string, tunnelInterface string) error {
++	if NativeConfigDisabled {
++		return nil
++	}
+ 	_, err := windowsEnsureBypassRoute(destIP, tunnelInterface)
+ 	return err
+ }
+@@ -209,6 +215,9 @@ func windowsBypassNextHop(routes []winipcfg.MibIPforwardRow2, addr netip.Addr, t
+ // route is the most specific match for destIP and the lookup would just find
+ // itself - so it instead deletes by exact destination prefix alone.
+ func WindowsRemoveBypassRoute(destIP string) error {
++	if NativeConfigDisabled {
++		return nil
++	}
+ 	addr, err := netip.ParseAddr(destIP)
+ 	if err != nil {
+ 		return fmt.Errorf("invalid destination address: %v", err)
+@@ -242,6 +251,10 @@ func WindowsRemoveBypassRoute(destIP string) error {
+ }
+ 
+ func WindowsRemoveRoute(destination string, interfaceName string) error {
++	if NativeConfigDisabled {
++		return nil
++	}
++
+ 	// Parse destination CIDR
+ 	_, ipNet, err := net.ParseCIDR(destination)
+ 	if err != nil {

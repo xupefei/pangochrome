@@ -1,0 +1,5 @@
+# Upstream Go modules that scripts/upstream.sh builds into host/third_party/<name>.
+# The hash is the module's go.sum hash. The script refuses a download with another hash.
+# name  module                 version  hash
+newt    github.com/fosrl/newt  v1.19.0  h1:7ELF+fIqYBbCNsIAIQVkklYFIweaA9I8Va91+OaIe2M=
+olm     github.com/fosrl/olm   v1.10.2  h1:pj72Fu+b+fzydOv4QZRi+CpeM/iLKL+5jyrk1+oqlVY=

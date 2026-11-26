@@ -1,4 +1,7 @@
+# Built by scripts/upstream.sh prepare from patches/.
+host/third_party/
 node_modules/
 extension/dist/
 dist/
 *.log
+.DS_Store

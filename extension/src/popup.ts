@@ -6,9 +6,9 @@ import type {
   Snapshot,
 } from "./messages";
 import type { ExitNode, LoginInfo, Site, State } from "./protocol";
+import { helperRunsOn, installCommand } from "./install";
 import { isHttpUrl, isPlainHostname } from "./url";
 
-const INSTALL_COMMAND = "pangochrome-helper install";
 const CLOUD_SERVER = "https://app.pangolin.net";
 /** The search box appears when the site list has more aliases than this. */
 const SEARCH_ALIAS_THRESHOLD = 6;
@@ -44,9 +44,18 @@ let lastRenderKey = "";
 const busy = new Set<string>();
 /** The value that the connect toggle shows while its request is in flight. */
 let pendingToggle: boolean | null = null;
+/** chrome.runtime.PlatformInfo os, once known. */
+let platformOs: string | null = null;
 
 connect();
 render(true);
+chrome.runtime.getPlatformInfo().then(
+  (info) => {
+    platformOs = info.os;
+    render(true);
+  },
+  () => undefined,
+);
 
 function connect(): void {
   let next: chrome.runtime.Port;
@@ -183,11 +192,7 @@ function statusView(text: string): HTMLElement {
 function helperView(helper: HelperStatus): HTMLElement {
   const view = section();
   if (helper.kind === "notInstalled") {
-    view.append(
-      heading("Helper required"),
-      el("p", "muted", "Pangochrome needs its helper to reach private sites. Install it, then press Retry."),
-      commandRow(INSTALL_COMMAND),
-    );
+    view.append(heading("Helper required"), ...installParts());
   } else if (helper.kind === "failed") {
     view.append(
       heading("Helper not running"),
@@ -553,6 +558,21 @@ function footer(state: State): HTMLElement {
   logout.disabled = isBusy("logout");
   footerEl.append(who, logout);
   return footerEl;
+}
+
+function installParts(): HTMLElement[] {
+  if (platformOs === null) return [];
+  if (!helperRunsOn(platformOs)) {
+    return [el("p", "muted", "The Pangochrome helper runs on macOS and Linux only.")];
+  }
+  const command = installCommand(chrome.runtime.getManifest().version, chrome.runtime.id);
+  if (command === null) {
+    return [el("p", "muted", "This build of Pangochrome has no matching helper release.")];
+  }
+  return [
+    el("p", "muted", "Pangochrome needs its helper to reach private sites. Run this command in a terminal, then press Retry."),
+    commandRow(command),
+  ];
 }
 
 function commandRow(command: string): HTMLElement {

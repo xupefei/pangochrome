@@ -33,9 +33,8 @@ require (
 	software.sslmate.com/src/go-pkcs12 v0.7.4 // indirect
 )
 
-// Upstream olm v1.10.2 with a netstack mode; see third_party/olm/PANGOCHROME.md.
+// Pinned upstream olm and newt with the patches in ../patches. Run
+// `make prepare` (scripts/upstream.sh prepare) to build these directories.
 replace github.com/fosrl/olm => ./third_party/olm
 
-// newt v1.19.0 with two fixes netstack mode relies on; see
-// third_party/olm/PANGOCHROME.md: https://github.com/xupefei/newt/tree/pangochrome
-replace github.com/fosrl/newt => github.com/xupefei/newt v0.0.0-20261111124430-1c0716d079cd
+replace github.com/fosrl/newt => ./third_party/newt

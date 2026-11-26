@@ -1,0 +1,382 @@
+diff --git a/api/api.go b/api/api.go
+index ca701bf872cc673863d78c14307116cb3f6124f1..1e69dd2036c84aaf5d5cea8900cfb34bbb379ab8 100644
+--- a/api/api.go
++++ b/api/api.go
+@@ -5,6 +5,7 @@ import (
+ 	"fmt"
+ 	"net"
+ 	"net/http"
++	"slices"
+ 	"strconv"
+ 	"sync"
+ 	"time"
+@@ -712,20 +713,40 @@ func (s *API) handleMetadataChange(w http.ResponseWriter, r *http.Request) {
+ 	})
+ }
+ 
++// GetStatus returns a copy of the status that shares no maps, slices or
++// pointers with the API, so the caller can read it while olm updates it.
+ func (s *API) GetStatus() StatusResponse {
++	s.statusMu.RLock()
++	defer s.statusMu.RUnlock()
++
++	peerStatuses := make(map[int]*PeerStatus, len(s.peerStatuses))
++	for id, ps := range s.peerStatuses {
++		c := *ps
++		peerStatuses[id] = &c
++	}
++	var olmError *OlmError
++	if s.olmError != nil {
++		c := *s.olmError
++		olmError = &c
++	}
++	var exitNodeStatus *ExitNodeStatus
++	if s.exitNodeStatus != nil {
++		c := *s.exitNodeStatus
++		exitNodeStatus = &c
++	}
+ 	return StatusResponse{
+ 		Connected:       s.isConnected,
+ 		Registered:      s.isRegistered,
+ 		Terminated:      s.isTerminated,
+-		OlmError:        s.olmError,
++		OlmError:        olmError,
+ 		Version:         s.version,
+ 		Agent:           s.agent,
+ 		OrgID:           s.orgID,
+-		PeerStatuses:    s.peerStatuses,
++		PeerStatuses:    peerStatuses,
+ 		NetworkSettings: network.GetSettings(),
+-		ExitNodeStatus:  s.exitNodeStatus,
++		ExitNodeStatus:  exitNodeStatus,
+ 		GatewayActive:   s.gatewayActive,
+-		GatewaySiteIds:  s.gatewaySiteIds,
++		GatewaySiteIds:  slices.Clone(s.gatewaySiteIds),
+ 
+ 		GatewaySiteResourceId: s.gatewaySiteResourceId,
+ 	}
+diff --git a/dns/resolve_local.go b/dns/resolve_local.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..18e2ace7c6ee215411df6c112f6104c006bcccb5
+--- /dev/null
++++ b/dns/resolve_local.go
+@@ -0,0 +1,46 @@
++package dns
++
++import (
++	"net"
++	"slices"
++	"strings"
++)
++
++// ResolveLocal answers an A query for name from the local alias records
++// only. Like a DNS query to the proxy, a match calls the JIT handler, so
++// that the site that owns the alias connects on demand.
++func (p *DNSProxy) ResolveLocal(name string) ([]net.IP, bool) {
++	ips, ok := p.recordStore.GetRecords(name, RecordTypeA)
++	if !ok || len(ips) == 0 {
++		return nil, false
++	}
++	if handler := p.jitHandler; handler != nil {
++		if siteId, ok := p.recordStore.GetSiteIdForDomain(name); ok && siteId != 0 {
++			go handler(siteId)
++		}
++	}
++	return ips, true
++}
++
++// LocalNames returns every local alias name and wildcard pattern, without
++// the trailing dot, sorted. It includes aliases of sites that are not
++// connected yet.
++func (p *DNSProxy) LocalNames() []string {
++	return p.recordStore.Names()
++}
++
++// Names returns every exact domain and wildcard pattern in the store,
++// without the trailing dot, sorted.
++func (s *DNSRecordStore) Names() []string {
++	s.mu.RLock()
++	defer s.mu.RUnlock()
++	names := make([]string, 0, len(s.exact)+len(s.wildcards))
++	for name := range s.exact {
++		names = append(names, strings.TrimSuffix(name, "."))
++	}
++	for pattern := range s.wildcards {
++		names = append(names, strings.TrimSuffix(pattern, "."))
++	}
++	slices.Sort(names)
++	return names
++}
+diff --git a/go.mod b/go.mod
+index 58634b493d7efeac73b98fa43ac327c922847c3c..6e0e45f850831985cddee0e90f5ceed2d1435b07 100644
+--- a/go.mod
++++ b/go.mod
+@@ -34,3 +34,6 @@ require (
+ 
+ // To be used ONLY for local development
+ // replace github.com/fosrl/newt => ../newt
++
++// Pangochrome: the patched newt that scripts/upstream.sh builds next to olm.
++replace github.com/fosrl/newt => ../newt
+diff --git a/olm/connect.go b/olm/connect.go
+index 48748f7d4b53f81c0c707262357673e5b785a3ee..eb7b027b5a5e4788659063c0cf9f413ff2cde015 100644
+--- a/olm/connect.go
++++ b/olm/connect.go
+@@ -89,10 +89,14 @@ func (o *Olm) handleConnect(msg websocket.WSMessage) {
+ 	// competing routes to the same destination. On macOS specifically this
+ 	// package's darwin code paths would otherwise run for real here (the NE
+ 	// build shares GOOS=darwin with the CLI), unlike iOS where they're already
+-	// no-ops via a GOOS check.
+-	network.NativeConfigDisabled = o.tunnelConfig.FileDescriptorTun != 0
++	// no-ops via a GOOS check. In netstack mode there is no OS interface at
++	// all, so nothing on the host may be configured either.
++	network.NativeConfigDisabled = o.olmConfig.Netstack || o.tunnelConfig.FileDescriptorTun != 0
+ 
+ 	o.tdev, err = func() (tun.Device, error) {
++		if o.olmConfig.Netstack {
++			return o.createNetstackTUN(wgData.TunnelIP)
++		}
+ 		if o.tunnelConfig.FileDescriptorTun != 0 {
+ 			return olmDevice.CreateTUNFromFD(o.tunnelConfig.FileDescriptorTun, o.tunnelConfig.MTU)
+ 		}
+@@ -228,7 +232,7 @@ func (o *Olm) handleConnect(msg websocket.WSMessage) {
+ 	// PeerManager.SetExitNode/SetGateway - rather than being pre-seeded here,
+ 	// so a failed initial exit-node/gateway setup can never leave routes
+ 	// stuck suppressed with nothing active to justify it.
+-	o.peerManager = peers.NewPeerManager(peers.PeerManagerConfig{
++	pm := peers.NewPeerManager(peers.PeerManagerConfig{
+ 		Device:                            o.dev,
+ 		DNSProxy:                          o.dnsProxy,
+ 		InterfaceName:                     o.tunnelConfig.InterfaceName,
+@@ -241,6 +245,9 @@ func (o *Olm) handleConnect(msg websocket.WSMessage) {
+ 		PublicDNS:                         o.tunnelConfig.PublicDNS,
+ 		DisableRoutesAndAliasesOnExitNode: o.tunnelConfig.DisableRoutesAndAliasesOnExitNode,
+ 	})
++	o.peerManagerMu.Lock()
++	o.peerManager = pm
++	o.peerManagerMu.Unlock()
+ 
+ 	for i := range wgData.Sites {
+ 		site := wgData.Sites[i]
+@@ -331,6 +338,7 @@ func (o *Olm) handleConnect(msg websocket.WSMessage) {
+ 	o.apiServer.SetRegistered(true)
+ 
+ 	o.registered = true
++	o.publishNetstack()
+ 
+ 	if len(o.tunnelConfig.GatewaySiteIds) > 0 {
+ 		o.applyPendingGatewayConfig(o.tunnelConfig.GatewaySiteResourceId, o.tunnelConfig.GatewaySiteIds)
+diff --git a/olm/netstack.go b/olm/netstack.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..e1433e960bf3adba406b75ad530cbacdbfe486c8
+--- /dev/null
++++ b/olm/netstack.go
+@@ -0,0 +1,110 @@
++package olm
++
++import (
++	"fmt"
++	"net/netip"
++	"strings"
++	"sync"
++
++	"github.com/fosrl/olm/dns"
++	"github.com/fosrl/olm/peers"
++	"golang.zx2c4.com/wireguard/tun"
++	"golang.zx2c4.com/wireguard/tun/netstack"
++)
++
++// netstackState is the userspace stack of the current connection.
++// handleConnect publishes it when the connection is ready. Close clears it
++// before teardown starts, so Net returns nil from then on. Dials on a stack
++// obtained earlier fail once the device closes.
++type netstackState struct {
++	mu       sync.RWMutex
++	pending  *netstack.Net // created with the device, not yet published
++	net      *netstack.Net
++	dnsProxy *dns.DNSProxy
++}
++
++// createNetstackTUN creates the userspace device that replaces the OS TUN
++// interface in netstack mode. tunnelIP may carry a CIDR suffix.
++func (o *Olm) createNetstackTUN(tunnelIP string) (tun.Device, error) {
++	addr, err := netip.ParseAddr(strings.Split(tunnelIP, "/")[0])
++	if err != nil {
++		return nil, fmt.Errorf("invalid tunnel IP %q: %w", tunnelIP, err)
++	}
++	tdev, tnet, err := netstack.CreateNetTUN([]netip.Addr{addr}, nil, o.tunnelConfig.MTU)
++	if err != nil {
++		return nil, err
++	}
++	o.netstack.mu.Lock()
++	o.netstack.pending = tnet
++	o.netstack.mu.Unlock()
++	return tdev, nil
++}
++
++func (o *Olm) publishNetstack() {
++	o.netstack.mu.Lock()
++	defer o.netstack.mu.Unlock()
++	o.netstack.net = o.netstack.pending
++	o.netstack.dnsProxy = o.dnsProxy
++}
++
++func (o *Olm) clearNetstack() {
++	o.netstack.mu.Lock()
++	defer o.netstack.mu.Unlock()
++	o.netstack.pending = nil
++	o.netstack.net = nil
++	o.netstack.dnsProxy = nil
++}
++
++// Net returns the userspace stack of the connected tunnel. It is nil in TUN
++// mode and while no tunnel is connected.
++func (o *Olm) Net() *netstack.Net {
++	o.netstack.mu.RLock()
++	defer o.netstack.mu.RUnlock()
++	return o.netstack.net
++}
++
++// ResolveAlias returns the IPv4 addresses of a Pangolin DNS alias. Like a
++// DNS query to the olm DNS proxy, a match also starts a just-in-time
++// connection to the site that owns the alias, if it is not connected.
++func (o *Olm) ResolveAlias(name string) ([]netip.Addr, bool) {
++	o.netstack.mu.RLock()
++	proxy := o.netstack.dnsProxy
++	o.netstack.mu.RUnlock()
++	if proxy == nil {
++		return nil, false
++	}
++	ips, ok := proxy.ResolveLocal(name)
++	if !ok {
++		return nil, false
++	}
++	addrs := make([]netip.Addr, 0, len(ips))
++	for _, ip := range ips {
++		if addr, ok := netip.AddrFromSlice(ip); ok {
++			addrs = append(addrs, addr.Unmap())
++		}
++	}
++	return addrs, len(addrs) > 0
++}
++
++// AliasNames returns every Pangolin alias name and wildcard pattern of the
++// current connection, including aliases of sites that connect just in time.
++func (o *Olm) AliasNames() []string {
++	o.netstack.mu.RLock()
++	proxy := o.netstack.dnsProxy
++	o.netstack.mu.RUnlock()
++	if proxy == nil {
++		return nil
++	}
++	return proxy.LocalNames()
++}
++
++// Sites returns a copy of the connected site peers, with their remote
++// subnets and aliases. Sites that connect just in time appear only after
++// they connect.
++func (o *Olm) Sites() []peers.SiteConfig {
++	pm := o.getPeerManager()
++	if pm == nil {
++		return nil
++	}
++	return pm.SnapshotPeers()
++}
+diff --git a/olm/olm.go b/olm/olm.go
+index 38245a44822e2d6c21ac7c734967a0bb052c91b8..b4132aabd096133326fe6efce4b091ac65e3a4cf 100644
+--- a/olm/olm.go
++++ b/olm/olm.go
+@@ -147,6 +147,9 @@ type Olm struct {
+ 	// External DNS watchdog process (spawned after DNS override is installed).
+ 	// nil when no watchdog is running.
+ 	dnsWatchdogCmd *exec.Cmd
++
++	// netstack holds the userspace stack in netstack mode - see netstack.go.
++	netstack netstackState
+ }
+ 
+ // getPeerManager safely returns the current peerManager under a read-lock.
+@@ -268,11 +271,12 @@ func Init(ctx context.Context, config OlmConfig) (*Olm, error) {
+ 		config.WakeUpDebounce = 3 * time.Second
+ 	}
+ 
+-	logger.Debug("Checking permissions for native interface")
+-	err := permissions.CheckNativeInterfacePermissions()
+-	if err != nil {
+-		logger.Fatal("Insufficient permissions to create native TUN interface: %v", err)
+-		return nil, err
++	if !config.Netstack {
++		logger.Debug("Checking permissions for native interface")
++		if err := permissions.CheckNativeInterfacePermissions(); err != nil {
++			logger.Fatal("Insufficient permissions to create native TUN interface: %v", err)
++			return nil, err
++		}
+ 	}
+ 
+ 	var apiServer *api.API
+@@ -505,6 +509,13 @@ func (o *Olm) StartTunnel(config TunnelConfig) {
+ 	logger.Debug("Starting tunnel with config: %+v", config)
+ 
+ 	o.tunnelRunning = true // Also set it here in case it is called externally
++	if o.olmConfig.Netstack {
++		// Netstack mode owns no OS interface, so none of these can apply.
++		config.NativeDNSManaged = true
++		config.OverrideDNS = false
++		config.EnableUAPI = false
++		config.SubnetRouter = false
++	}
+ 	o.tunnelConfig = config
+ 	network.PreferLocalRoutes = config.PreferLocalRoutes
+ 
+@@ -923,6 +934,8 @@ func (o *Olm) StartTunnel(config TunnelConfig) {
+ }
+ 
+ func (o *Olm) Close() {
++	o.clearNetstack()
++
+ 	// Stop registration first to prevent it from trying to use closed websocket
+ 	if o.stopRegister != nil {
+ 		logger.Debug("Stopping registration interval")
+diff --git a/olm/types.go b/olm/types.go
+index 99ec9282e69bd6cf6b829c16da06162fd5d1375a..989942a6373c4cfaf7ba20fd8ff3f50ce2329706 100644
+--- a/olm/types.go
++++ b/olm/types.go
+@@ -115,6 +115,12 @@ type OlmConfig struct {
+ 	WatchdogExecutable string
+ 	WatchdogSubcommand []string
+ 	WatchdogLogFile    string
++
++	// Netstack runs the WireGuard device on a userspace TCP/IP stack instead
++	// of an OS TUN interface. olm then needs no privileges and changes no
++	// host interfaces, routes or DNS. Reach the tunnel through Olm.Net and
++	// Olm.ResolveAlias.
++	Netstack bool
+ }
+ 
+ type TunnelConfig struct {
+diff --git a/peers/snapshot.go b/peers/snapshot.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..1baad0d6a2b87b87017df49998fe1157e2822069
+--- /dev/null
++++ b/peers/snapshot.go
+@@ -0,0 +1,20 @@
++package peers
++
++import "slices"
++
++// SnapshotPeers returns a deep copy of every tracked site peer. Unlike
++// GetAllPeers, the result shares no slices with the manager, so callers can
++// read it while the manager keeps updating peers.
++func (pm *PeerManager) SnapshotPeers() []SiteConfig {
++	pm.mu.RLock()
++	defer pm.mu.RUnlock()
++	out := make([]SiteConfig, 0, len(pm.peers))
++	for _, peer := range pm.peers {
++		peer.LocalEndpoints = slices.Clone(peer.LocalEndpoints)
++		peer.RemoteSubnets = slices.Clone(peer.RemoteSubnets)
++		peer.AllowedIps = slices.Clone(peer.AllowedIps)
++		peer.Aliases = slices.Clone(peer.Aliases)
++		out = append(out, peer)
++	}
++	return out
++}

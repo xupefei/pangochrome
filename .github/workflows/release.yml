@@ -1,0 +1,46 @@
+name: Release
+
+# Push a tag vX.Y.Z that equals the extension version to publish a release
+# with the helpers, install.sh, the Chrome Web Store zip and SHA256SUMS.txt.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: host/go.mod
+          cache-dependency-path: host/go.sum
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: extension/package-lock.json
+      - name: Check that the tag equals the extension version
+        run: |
+          version=$(node -p 'require("./extension/static/manifest.json").version')
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not equal the extension version $version."
+            exit 1
+          fi
+      - run: npm ci
+        working-directory: extension
+      - run: make test
+      - run: make release VERSION="$GITHUB_REF_NAME"
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: dist
+        run: |
+          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes \
+            --title "Pangochrome $GITHUB_REF_NAME" \
+            pangochrome-helper-linux-amd64 pangochrome-helper-linux-arm64 \
+            pangochrome-helper-darwin-amd64 pangochrome-helper-darwin-arm64 \
+            "pangochrome-extension-$GITHUB_REF_NAME.zip" install.sh SHA256SUMS.txt
