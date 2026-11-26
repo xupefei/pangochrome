@@ -1,6 +1,6 @@
 {
   "name": "pangochrome-extension",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Chrome extension for Pangochrome: login, routing and proxy control for the Pangochrome helper.",
   "scripts": {
